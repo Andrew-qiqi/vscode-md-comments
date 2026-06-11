@@ -1,0 +1,166 @@
+{
+  "name": "vscode-md-comments",
+  "displayName": "VSCode MD Comments",
+  "description": "Notion-style review comments stored as CriticMarkup. AI-friendly format for LLM-assisted editing.",
+  "version": "1.0.0",
+  "publisher": "andrew-qiqi",
+  "engines": {
+    "vscode": "^1.74.0"
+  },
+  "categories": [
+    "Other",
+    "Visualization",
+    "Formatters"
+  ],
+  "main": "./dist/extension.js",
+  "activationEvents": [
+    "onLanguage:markdown"
+  ],
+  "contributes": {
+    "commands": [
+      {
+        "command": "review-comments.add",
+        "title": "Add Comment to Selection",
+        "icon": "$(comment-discussion)"
+      },
+      {
+        "command": "review-comments.submitAdd",
+        "title": "Save",
+        "icon": "$(check)"
+      },
+      {
+        "command": "review-comments.cancelAdd",
+        "title": "Cancel",
+        "icon": "$(close)"
+      },
+      {
+        "command": "review-comments.resolve",
+        "title": "Resolve Comment"
+      },
+      {
+        "command": "review-comments.edit",
+        "title": "Edit Comment"
+      },
+      {
+        "command": "review-comments.submitEdit",
+        "title": "Save",
+        "icon": "$(check)"
+      },
+      {
+        "command": "review-comments.cancelEdit",
+        "title": "Cancel",
+        "icon": "$(close)"
+      }
+    ],
+    "keybindings": [
+      {
+        "command": "review-comments.add",
+        "key": "ctrl+shift+m",
+        "mac": "cmd+shift+m",
+        "when": "editorHasSelection && editorLangId == markdown"
+      }
+    ],
+    "menus": {
+      "commandPalette": [
+        {
+          "command": "review-comments.submitAdd",
+          "when": "false"
+        },
+        {
+          "command": "review-comments.cancelAdd",
+          "when": "false"
+        },
+        {
+          "command": "review-comments.submitEdit",
+          "when": "false"
+        },
+        {
+          "command": "review-comments.cancelEdit",
+          "when": "false"
+        }
+      ],
+      "editor/context": [
+        {
+          "command": "review-comments.add",
+          "when": "editorHasSelection && editorLangId == markdown",
+          "group": "1_modification"
+        }
+      ],
+      "comments/comment/context": [
+        {
+          "command": "review-comments.submitAdd",
+          "group": "inline@1",
+          "when": "comment == draftComment"
+        },
+        {
+          "command": "review-comments.cancelAdd",
+          "group": "inline@2",
+          "when": "comment == draftComment"
+        },
+        {
+          "command": "review-comments.submitEdit",
+          "group": "inline@1",
+          "when": "comment == editableComment"
+        },
+        {
+          "command": "review-comments.cancelEdit",
+          "group": "inline@2",
+          "when": "comment == editableComment"
+        }
+      ]
+    },
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "review-comments-explorer",
+          "title": "MD Comments",
+          "icon": "media/icon.svg"
+        }
+      ]
+    },
+    "views": {
+      "review-comments-explorer": [
+        {
+          "type": "webview",
+          "id": "review-comments-sidebar",
+          "name": "Review Comments",
+          "icon": "media/icon.svg"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "Review Comments",
+      "properties": {
+        "review-comments.authorName": {
+          "type": "string",
+          "default": "you",
+          "description": "Name recorded in comments."
+        },
+        "review-comments.dateFormat": {
+          "type": "string",
+          "enum": [
+            "iso",
+            "japanese"
+          ],
+          "default": "iso",
+          "description": "Date format."
+        }
+      }
+    },
+    "markdown.markdownItPlugins": true,
+    "markdown.previewStyles": [
+      "./media/preview.css"
+    ]
+  },
+  "scripts": {
+    "compile": "node esbuild.js",
+    "watch": "node esbuild.js --watch",
+    "package": "node esbuild.js --production"
+  },
+  "devDependencies": {
+    "@types/node": "^16.11.7",
+    "@types/vscode": "^1.74.0",
+    "esbuild": "^0.19.11",
+    "typescript": "^5.3.3"
+  }
+}
