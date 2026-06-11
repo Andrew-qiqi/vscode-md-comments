@@ -6,6 +6,15 @@ A VS Code extension for adding and managing review comments in Markdown files us
 
 ---
 
+## 核心设计 (Core Philosophy)
+
+- **原生内联存储 (Inline Storage)**：批注使用 CriticMarkup 语法直接插入并保存在 `.md` 文件正文中（非外部或数据库分离存储），完全跟随文件流动。
+- **AI 友好 (AI Agent Friendly)**：由于批注与文本一体化存放于 Markdown 文件中，极易被各种 LLM / AI 智能体读取、理解、修改或应用。
+- **Inline Storage**: Comments are saved directly in the body of the `.md` file using CriticMarkup syntax. They are kept together with the file content, not stored separately.
+- **AI Friendly**: Since comments are inline within the Markdown code, they are easily visible, parseable, and editable by LLMs and AI agents.
+
+---
+
 ## 功能介绍 (Features)
 
 1. **语法隐藏与高亮 (Syntax Concealment & Highlighting)**:
