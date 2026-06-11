@@ -15,6 +15,20 @@ A VS Code extension for adding and managing review comments in Markdown files us
 
 ---
 
+## 使用方法 (Usage)
+
+### 1. 添加批注 (Add Comment)
+- **快捷键 (Shortcut)**: `Ctrl + Shift + M` (macOS: `Cmd + Shift + M`)
+- **操作 (Steps)**: 选中一段文本 -> 按快捷键或右键选择 **Add Comment to Selection** -> 在弹出框中输入内容 -> 点击对勾保存。
+- Select text -> Press shortcut -> Type in the input box -> Click Save.
+
+### 2. 编辑或删除批注 (Edit or Delete)
+- **方法 A (Hover)**: 鼠标悬停在高亮文本上 -> 点击 `[✏️ Edit]` 重新编辑，或点击 `[✔️ Resolve]` 解决（保留原文并移除批注）。
+- **方法 B (Sidebar)**: 在侧边栏面板列表中，点击铅笔图标编辑，或点击对勾图标解决。
+- Use hover action links or the sidebar panel list to edit or remove comments.
+
+---
+
 ## 功能介绍 (Features)
 
 1. **语法隐藏与高亮 (Syntax Concealment & Highlighting)**:
@@ -37,20 +51,6 @@ A VS Code extension for adding and managing review comments in Markdown files us
    - 在侧边栏“MD Comments”面板中展示当前文件的所有批注卡片。
    - 支持点击卡片定位到正文对应行、在卡片中直接修改批注内容或标记解决。
    - Lists all review comments in the current active markdown file, allowing you to navigate, edit, or resolve them.
-
----
-
-## 使用方法 (Usage)
-
-### 1. 添加批注 (Add Comment)
-- **快捷键 (Shortcut)**: `Ctrl + Shift + M` (macOS: `Cmd + Shift + M`)
-- **操作 (Steps)**: 选中一段文本 -> 按快捷键或右键选择 **Add Comment to Selection** -> 在弹出框中输入内容 -> 点击对勾保存。
-- Select text -> Press shortcut -> Type in the input box -> Click Save.
-
-### 2. 编辑或删除批注 (Edit or Delete)
-- **方法 A (Hover)**: 鼠标悬停在高亮文本上 -> 点击 `[✏️ Edit]` 重新编辑，或点击 `[✔️ Resolve]` 解决。
-- **方法 B (Sidebar)**: 在侧边栏面板列表中，点击铅笔图标编辑，或点击对勾图标解决。
-- Use hover action links or the sidebar panel list to edit or remove comments.
 
 ---
 
