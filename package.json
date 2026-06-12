@@ -2,8 +2,12 @@
   "name": "vscode-md-comments",
   "displayName": "VSCode MD Comments",
   "description": "Notion-style review comments stored as CriticMarkup. AI-friendly format for LLM-assisted editing.",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "publisher": "andrew-qiqi",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Andrew-qiqi/vscode-md-comments.git"
+  },
   "engines": {
     "vscode": "^1.74.0"
   },
@@ -14,7 +18,9 @@
   ],
   "main": "./dist/extension.js",
   "activationEvents": [
-    "onLanguage:markdown"
+    "onLanguage:markdown",
+    "onCommand:review-comments.openPreview",
+    "onCustomEditor:review-comments.preview"
   ],
   "contributes": {
     "commands": [
@@ -22,6 +28,11 @@
         "command": "review-comments.add",
         "title": "Add Comment to Selection",
         "icon": "$(comment-discussion)"
+      },
+      {
+        "command": "review-comments.openPreview",
+        "title": "Open MD Comments Preview",
+        "icon": "$(open-preview)"
       },
       {
         "command": "review-comments.submitAdd",
@@ -84,6 +95,13 @@
           "command": "review-comments.add",
           "when": "editorHasSelection && editorLangId == markdown",
           "group": "1_modification"
+        }
+      ],
+      "editor/title": [
+        {
+          "command": "review-comments.openPreview",
+          "when": "resourceLangId == markdown",
+          "group": "navigation@1"
         }
       ],
       "comments/comment/context": [
@@ -150,6 +168,18 @@
     "markdown.markdownItPlugins": true,
     "markdown.previewStyles": [
       "./media/preview.css"
+    ],
+    "customEditors": [
+      {
+        "viewType": "review-comments.preview",
+        "displayName": "MD Comments Preview",
+        "priority": "option",
+        "selector": [
+          {
+            "filenamePattern": "*.md"
+          }
+        ]
+      }
     ]
   },
   "scripts": {

@@ -4,8 +4,6 @@ import { parseAllComments, CommentMatch } from './commentParser';
 export class ReviewCommentsSidebarProvider implements vscode.WebviewViewProvider {
   public static readonly viewType = 'review-comments-sidebar';
   private _view?: vscode.WebviewView;
-  private _lastActiveDocument?: vscode.TextDocument;
-
   constructor(private readonly _extensionContext: vscode.ExtensionContext) {}
 
   public resolveWebviewView(
@@ -23,7 +21,7 @@ export class ReviewCommentsSidebarProvider implements vscode.WebviewViewProvider
     webviewView.webview.html = this._getHtmlForWebview(webviewView.webview);
 
     webviewView.webview.onDidReceiveMessage(async (data) => {
-      const document = vscode.window.activeTextEditor?.document || this._lastActiveDocument;
+      const document = await this._getCurrentMarkdownDocument();
 
       switch (data.type) {
         case 'ready': {
@@ -31,15 +29,29 @@ export class ReviewCommentsSidebarProvider implements vscode.WebviewViewProvider
           break;
         }
         case 'jump': {
-          const editor = vscode.window.activeTextEditor;
-          if (editor) {
-            const text = editor.document.getText();
+          if (document) {
+            const text = document.getText();
             const index = text.indexOf(data.full);
             if (index !== -1) {
-              const startPos = editor.document.positionAt(index);
-              const endPos = editor.document.positionAt(index + data.full.length);
+              const activeInput = vscode.window.tabGroups.activeTabGroup.activeTab?.input;
+              if (activeInput instanceof vscode.TabInputCustom && activeInput.viewType === 'review-comments.preview') {
+                await vscode.commands.executeCommand('review-comments.revealInOwnedPreview', document.uri.toString(), data.full);
+                break;
+              }
+
+              const visibleEditor = vscode.window.visibleTextEditors.find(editor =>
+                editor.document.uri.toString() === document.uri.toString()
+              );
+              const editor = visibleEditor || await vscode.window.showTextDocument(document, {
+                preview: false,
+                preserveFocus: false
+              });
+
+              const startPos = document.positionAt(index);
+              const endPos = document.positionAt(index + data.full.length);
+              const range = new vscode.Range(startPos, endPos);
               editor.selection = new vscode.Selection(startPos, endPos);
-              editor.revealRange(new vscode.Range(startPos, endPos), vscode.TextEditorRevealType.InCenter);
+              editor.revealRange(range, vscode.TextEditorRevealType.InCenter);
             }
           }
           break;
@@ -100,17 +112,12 @@ export class ReviewCommentsSidebarProvider implements vscode.WebviewViewProvider
     }
   }
 
-  public refresh() {
+  public async refresh() {
     if (!this._view) {
       return;
     }
 
-    const editor = vscode.window.activeTextEditor;
-    if (editor && editor.document.languageId === 'markdown') {
-      this._lastActiveDocument = editor.document;
-    }
-
-    const document = this._lastActiveDocument;
+    const document = await this._getCurrentMarkdownDocument();
     if (!document) {
       this._view.webview.postMessage({ type: 'update', state: 'no_editor' });
       return;
@@ -124,6 +131,31 @@ export class ReviewCommentsSidebarProvider implements vscode.WebviewViewProvider
       state: 'loaded',
       comments
     });
+  }
+
+  private async _getCurrentMarkdownDocument(): Promise<vscode.TextDocument | undefined> {
+    const activeEditor = vscode.window.activeTextEditor;
+    if (activeEditor?.document.languageId === 'markdown') {
+      return activeEditor.document;
+    }
+
+    const activeTab = vscode.window.tabGroups.activeTabGroup.activeTab;
+    const input = activeTab?.input;
+
+    if (input instanceof vscode.TabInputText) {
+      const document = await vscode.workspace.openTextDocument(input.uri);
+      return document.languageId === 'markdown' ? document : undefined;
+    }
+
+    if (
+      input instanceof vscode.TabInputCustom &&
+      (input.viewType === 'vscode.markdown.preview.editor' || input.viewType === 'review-comments.preview')
+    ) {
+      const document = await vscode.workspace.openTextDocument(input.uri);
+      return document.languageId === 'markdown' ? document : undefined;
+    }
+
+    return undefined;
   }
 
   private _getHtmlForWebview(webview: vscode.Webview): string {
