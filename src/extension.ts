@@ -1,8 +1,7 @@
 import * as vscode from 'vscode';
-import { parseAllComments, COMMENT_REGEX, parseMeta, getCommentHash } from './commentParser';
+import { parseAllComments, parseMeta, getCommentHash } from './commentParser';
 import { ReviewCommentsSidebarProvider } from './sidebar';
 import { PreviewSelectionPayload, locatePreviewSelection } from './previewProjection';
-import { ReviewCommentsPreviewProvider } from './commentsPreview';
 
 class ReviewComment implements vscode.Comment {
   constructor(
@@ -25,26 +24,18 @@ interface PreviewCommentCommandPayload {
   body?: string;
 }
 
+type CommentCommandPayload = string | PreviewCommentCommandPayload | undefined;
+
 let highlightDecorationType: vscode.TextEditorDecorationType;
 let braceDecorationType: vscode.TextEditorDecorationType;
 let commentDecorationType: vscode.TextEditorDecorationType;
 let logChannel: vscode.OutputChannel;
 let decorationTimeout: NodeJS.Timeout | undefined = undefined;
+let lastMarkdownDocumentUri: vscode.Uri | undefined = undefined;
 
 
 
 export function activate(context: vscode.ExtensionContext) {
-  let activeTempThread: vscode.CommentThread | undefined = undefined;
-  let lastMarkdownDocumentUri: vscode.Uri | undefined = undefined;
-  const commentController = vscode.comments.createCommentController('review-comments', 'Review Comments');
-  context.subscriptions.push(commentController);
-
-  // No commentingRangeProvider — removes gutter "+" icons on every line.
-  // We use our own commands (right-click / shortcut) to create threads.
-
-  // Minimize the widget: empty prompt removes the label above the textarea
-  commentController.options = { prompt: '', placeHolder: 'Type your comment...' };
-
   logChannel = vscode.window.createOutputChannel("Review Comments");
   logChannel.appendLine("[ReviewComments] Activating...");
   // Initialize decoration types
@@ -77,43 +68,13 @@ export function activate(context: vscode.ExtensionContext) {
 
   // Sidebar webview initialization
   const sidebarProvider = new ReviewCommentsSidebarProvider(context);
-  const commentsPreviewProvider = new ReviewCommentsPreviewProvider(context);
   context.subscriptions.push(
     vscode.window.registerWebviewViewProvider(
       ReviewCommentsSidebarProvider.viewType,
       sidebarProvider
-    ),
-    vscode.window.registerCustomEditorProvider(
-      ReviewCommentsPreviewProvider.viewType,
-      commentsPreviewProvider,
-      {
-        supportsMultipleEditorsPerDocument: false,
-        webviewOptions: {
-          retainContextWhenHidden: true
-        }
-      }
     )
   );
 
-  function startAddCommentThread(editor: vscode.TextEditor, range: vscode.Range) {
-    if (activeTempThread) {
-      activeTempThread.dispose();
-    }
-
-    activeTempThread = commentController.createCommentThread(editor.document.uri, range, []);
-    activeTempThread.collapsibleState = vscode.CommentThreadCollapsibleState.Expanded;
-    activeTempThread.canReply = false;
-    activeTempThread.label = '';
-
-    const comment = new ReviewComment(
-      '',
-      vscode.CommentMode.Editing,
-      { name: '' },
-      activeTempThread,
-      'draftComment'
-    );
-    activeTempThread.comments = [comment];
-  }
 
   async function getBestMarkdownEditor(): Promise<vscode.TextEditor | undefined> {
     const activeEditor = vscode.window.activeTextEditor;
@@ -148,7 +109,22 @@ export function activate(context: vscode.ExtensionContext) {
     return undefined;
   }
 
-  async function getMarkdownEditorContaining(text: string): Promise<vscode.TextEditor | undefined> {
+  async function getMarkdownEditorContaining(text: string, source?: string): Promise<vscode.TextEditor | undefined> {
+    if (source) {
+      try {
+        const document = await vscode.workspace.openTextDocument(vscode.Uri.parse(source));
+        if (document.languageId === 'markdown' && document.getText().includes(text)) {
+          lastMarkdownDocumentUri = document.uri;
+          return vscode.window.showTextDocument(document, {
+            preview: false,
+            viewColumn: vscode.ViewColumn.Beside
+          });
+        }
+      } catch {
+        // Fall back to visible/open markdown documents below.
+      }
+    }
+
     const visibleEditor = vscode.window.visibleTextEditors.find(editor =>
       editor.document.languageId === 'markdown' && editor.document.getText().includes(text)
     );
@@ -204,6 +180,21 @@ export function activate(context: vscode.ExtensionContext) {
     return vscode.workspace.textDocuments.find(document => document.languageId === 'markdown');
   }
 
+  function normalizeCommentCommandPayload(payload: CommentCommandPayload): PreviewCommentCommandPayload | undefined {
+    if (typeof payload === 'string') {
+      return { rawComment: payload };
+    }
+    if (payload && typeof payload.rawComment === 'string') {
+      return payload;
+    }
+    return undefined;
+  }
+
+  function parseUriArgs(argsStr: string): any[] {
+    const parsed = JSON.parse(argsStr);
+    return Array.isArray(parsed) ? parsed : [parsed];
+  }
+
   async function applyWorkspaceReplacement(document: vscode.TextDocument, range: vscode.Range, replacement: string) {
     const edit = new vscode.WorkspaceEdit();
     edit.replace(document.uri, range, replacement);
@@ -226,11 +217,24 @@ export function activate(context: vscode.ExtensionContext) {
       return document.languageId === 'markdown' ? document.uri : undefined;
     }
 
-    if (input instanceof vscode.TabInputCustom && input.viewType === ReviewCommentsPreviewProvider.viewType) {
+    if (input instanceof vscode.TabInputCustom && input.viewType === 'vscode.markdown.preview.editor') {
       return input.uri;
     }
 
     return undefined;
+  }
+
+  function syncSidebarNavigationContext() {
+    const activeEditor = vscode.window.activeTextEditor;
+    if (activeEditor?.document.languageId === 'markdown') {
+      sidebarProvider.setNavigationTarget(activeEditor.document.uri, 'source');
+      return;
+    }
+
+    const input = vscode.window.tabGroups.activeTabGroup.activeTab?.input;
+    if (input instanceof vscode.TabInputCustom && input.viewType === 'vscode.markdown.preview.editor') {
+      sidebarProvider.setNavigationTarget(input.uri, 'preview', vscode.window.tabGroups.activeTabGroup.viewColumn);
+    }
   }
 
   // Command: Add Comment to Selection
@@ -259,27 +263,13 @@ export function activate(context: vscode.ExtensionContext) {
         return;
       }
 
-      startAddCommentThread(editor, selection);
+      // Focus sidebar
+      await vscode.commands.executeCommand('review-comments-sidebar.focus');
+      // Show form in sidebar
+      await sidebarProvider.showNewCommentForm(selectedText, selection, editor.document.uri, 'source');
     } catch (err: any) {
       vscode.window.showErrorMessage(`Error in Add Comment: ${err.message || err}`);
     }
-  });
-
-  const openPreviewCommand = vscode.commands.registerCommand('review-comments.openPreview', async (resource?: vscode.Uri) => {
-    const uri = await getActiveMarkdownUri(resource);
-    if (!uri) {
-      vscode.window.showWarningMessage('Please open a Markdown file first.');
-      return;
-    }
-
-    await vscode.commands.executeCommand('vscode.openWith', uri, ReviewCommentsPreviewProvider.viewType, {
-      viewColumn: vscode.ViewColumn.Beside,
-      preview: false
-    });
-  });
-
-  const revealInOwnedPreviewCommand = vscode.commands.registerCommand('review-comments.revealInOwnedPreview', async (source: string, rawComment: string) => {
-    commentsPreviewProvider.reveal(vscode.Uri.parse(source), rawComment);
   });
 
   const addFromPreviewCommand = vscode.commands.registerCommand('review-comments.addFromPreview', async (payload: PreviewAddCommandPayload) => {
@@ -311,179 +301,49 @@ export function activate(context: vscode.ExtensionContext) {
         return;
       }
 
-      if (payload.body !== undefined) {
-        const text = payload.body.trim();
-        if (!text) {
-          vscode.window.showWarningMessage('Comment cannot be empty.');
-          return;
-        }
-
-        const config = vscode.workspace.getConfiguration('review-comments');
-        const author = (config.get<string>('authorName') || 'you').replace(/\|/g, '').trim();
-        const dateFormat = config.get<string>('dateFormat') || 'iso';
-        const dateStr = formatDate(new Date(), dateFormat);
-        const escapedText = text.replace(/<<}/g, "<< }");
-        const commentString = `{==${selectedText}==}{>>${author}|${dateStr}: ${escapedText}<<}`;
-        await applyWorkspaceReplacement(document, range, commentString);
-        sidebarProvider.refresh();
-        return;
-      }
-
-      const editor = await vscode.window.showTextDocument(document, {
-        preview: false,
-        viewColumn: vscode.ViewColumn.Beside
-      });
-      editor.selection = new vscode.Selection(range.start, range.end);
-      editor.revealRange(range, vscode.TextEditorRevealType.InCenterIfOutsideViewport);
-      startAddCommentThread(editor, range);
+      sidebarProvider.setNavigationTarget(document.uri, 'preview');
+      // Focus sidebar
+      await vscode.commands.executeCommand('review-comments-sidebar.focus');
+      // Show form in sidebar
+      await sidebarProvider.showNewCommentForm(selectedText, range, document.uri, 'preview');
     } catch (err: any) {
       vscode.window.showErrorMessage(`Error in Add Comment from Preview: ${err.message || err}`);
     }
   });
 
-  const editFromPreviewCommand = vscode.commands.registerCommand('review-comments.editFromPreview', async (payload: PreviewCommentCommandPayload) => {
-    try {
-      const text = (payload.body || '').trim();
-      if (!text) {
-        vscode.window.showWarningMessage('Comment cannot be empty.');
-        return;
-      }
-
-      const document = await getMarkdownDocument(payload.source);
-      if (!document) {
-        vscode.window.showWarningMessage('Please open a Markdown file first.');
-        return;
-      }
-
-      const source = document.getText();
-      const index = source.indexOf(payload.rawComment);
-      if (index === -1) {
-        vscode.window.showInformationMessage('No comment found for this preview item.');
-        return;
-      }
-
-      const highlightMatch = payload.rawComment.match(/^\{==([\s\S]+?)==\}\{>>([\s\S]+?)<<\}/);
-      if (!highlightMatch) {
-        return;
-      }
-
-      const highlightedText = highlightMatch[1];
-      const parsedMeta = parseMeta(highlightMatch[2]);
-      const escapedBody = text.replace(/<<}/g, "<< }");
-      const newComment = `{==${highlightedText}==}{>>${parsedMeta.author}|${parsedMeta.date}: ${escapedBody}<<}`;
-      const range = new vscode.Range(
-        document.positionAt(index),
-        document.positionAt(index + payload.rawComment.length)
-      );
-
-      await applyWorkspaceReplacement(document, range, newComment);
-      sidebarProvider.refresh();
-    } catch (err: any) {
-      vscode.window.showErrorMessage(`Error in Edit Comment from Preview: ${err.message || err}`);
-    }
-  });
-
-  const resolveFromPreviewCommand = vscode.commands.registerCommand('review-comments.resolveFromPreview', async (payload: PreviewCommentCommandPayload) => {
-    try {
-      const document = await getMarkdownDocument(payload.source);
-      if (!document) {
-        vscode.window.showWarningMessage('Please open a Markdown file first.');
-        return;
-      }
-
-      const source = document.getText();
-      const index = source.indexOf(payload.rawComment);
-      if (index === -1) {
-        vscode.window.showInformationMessage('No comment found for this preview item.');
-        return;
-      }
-
-      const highlightMatch = payload.rawComment.match(/^\{==([\s\S]+?)==\}/);
-      const highlighted = highlightMatch ? highlightMatch[1] : '';
-      const range = new vscode.Range(
-        document.positionAt(index),
-        document.positionAt(index + payload.rawComment.length)
-      );
-
-      await applyWorkspaceReplacement(document, range, highlighted);
-      sidebarProvider.refresh();
-    } catch (err: any) {
-      vscode.window.showErrorMessage(`Error in Resolve Comment from Preview: ${err.message || err}`);
-    }
-  });
-
-  // Command: Submit Add Comment
-  const submitAddCommand = vscode.commands.registerCommand('review-comments.submitAdd', async (comment: any) => {
-    try {
-      const text = (typeof comment.body === 'string' ? comment.body : comment.body.value).trim();
-      if (!text) {
-        vscode.window.showWarningMessage('Comment cannot be empty.');
-        return;
-      }
-
-      const thread = comment.parent;
-      if (!thread) {
-        return;
-      }
-      const uri = thread.uri;
-      const range = thread.range;
-      if (!range) {
-        return;
-      }
-      const editor = vscode.window.visibleTextEditors.find(e => e.document.uri.toString() === uri.toString());
-      if (!editor) {
-        thread.dispose();
-        return;
-      }
-
-      const selectedText = editor.document.getText(range);
-
-      const config = vscode.workspace.getConfiguration('review-comments');
-      const author = (config.get<string>('authorName') || 'you').replace(/\|/g, '').trim();
-      const dateFormat = config.get<string>('dateFormat') || 'iso';
-      const dateStr = formatDate(new Date(), dateFormat);
-
-      // Escape any <<} inside comment body
-      const escapedText = text.replace(/<<}/g, "<< }");
-      const commentString = `{==${selectedText}==}{>>${author}|${dateStr}: ${escapedText}<<}`;
-
-      await editor.edit(editBuilder => {
-        editBuilder.replace(range, commentString);
-      });
-
-      thread.dispose();
-      if (activeTempThread === thread) {
-        activeTempThread = undefined;
-      }
-      
-      // Focus the editor to ensure hover is closed
-      await vscode.commands.executeCommand('workbench.action.focusActiveEditorGroup');
-      sidebarProvider.refresh();
-    } catch (err: any) {
-      vscode.window.showErrorMessage(`Error in Submit Add Comment: ${err.message || err}`);
-    }
-  });
-
-  // Command: Cancel Add Comment
-  const cancelAddCommand = vscode.commands.registerCommand('review-comments.cancelAdd', async (comment: any) => {
-    try {
-      const thread = comment.parent;
-      if (thread) {
-        thread.dispose();
-        if (activeTempThread === thread) {
-          activeTempThread = undefined;
-        }
-      }
-      await vscode.commands.executeCommand('workbench.action.focusActiveEditorGroup');
-    } catch (err: any) {
-      vscode.window.showErrorMessage(`Error in Cancel Add Comment: ${err.message || err}`);
-    }
-  });
-
   // Command: Resolve Comment
-  const resolveCommand = vscode.commands.registerCommand('review-comments.resolve', async (rawComment?: string) => {
+  const resolveCommand = vscode.commands.registerCommand('review-comments.resolve', async (payload?: CommentCommandPayload) => {
     try {
-      let editor = vscode.window.activeTextEditor;
+      const commandPayload = normalizeCommentCommandPayload(payload);
+      const rawComment = commandPayload?.rawComment;
+      if (commandPayload?.source && rawComment) {
+        const document = await getMarkdownDocument(commandPayload.source);
+        const source = document?.getText();
+        const index = source?.indexOf(rawComment) ?? -1;
+        if (!document || index === -1) {
+          vscode.window.showInformationMessage('No comment found for this preview item.');
+          return;
+        }
+
+        sidebarProvider.setNavigationTarget(document.uri, 'preview');
+        const highlightMatch = rawComment.match(/^\{==([\s\S]+?)==\}/);
+        const highlighted = highlightMatch ? highlightMatch[1] : '';
+        const range = new vscode.Range(
+          document.positionAt(index),
+          document.positionAt(index + rawComment.length)
+        );
+        await applyWorkspaceReplacement(document, range, highlighted);
+        sidebarProvider.refresh(document.uri.toString());
+        return;
+      }
+
+      let editor = commandPayload?.source && rawComment
+        ? await getMarkdownEditorContaining(rawComment, commandPayload.source)
+        : vscode.window.activeTextEditor;
+      if (commandPayload?.source && rawComment && !editor) {
+        vscode.window.showInformationMessage('No comment found for this preview item.');
+        return;
+      }
       if ((!editor || editor.document.languageId !== 'markdown') && rawComment) {
         editor = await getMarkdownEditorContaining(rawComment);
       }
@@ -538,9 +398,30 @@ export function activate(context: vscode.ExtensionContext) {
   });
 
   // Command: Edit Comment
-  const editCommand = vscode.commands.registerCommand('review-comments.edit', async (rawComment?: string) => {
+  const editCommand = vscode.commands.registerCommand('review-comments.edit', async (payload?: CommentCommandPayload) => {
     try {
-      let editor = vscode.window.activeTextEditor;
+      const commandPayload = normalizeCommentCommandPayload(payload);
+      const rawComment = commandPayload?.rawComment;
+      if (commandPayload?.source && rawComment) {
+        const document = await getMarkdownDocument(commandPayload.source);
+        if (!document || !document.getText().includes(rawComment)) {
+          vscode.window.showInformationMessage('No comment found for this preview item.');
+          return;
+        }
+
+        sidebarProvider.setNavigationTarget(document.uri, 'preview');
+        await vscode.commands.executeCommand('review-comments-sidebar.focus');
+        await sidebarProvider.activateEditInSidebar(rawComment, document.uri, 'preview');
+        return;
+      }
+
+      let editor = commandPayload?.source && rawComment
+        ? await getMarkdownEditorContaining(rawComment, commandPayload.source)
+        : vscode.window.activeTextEditor;
+      if (commandPayload?.source && rawComment && !editor) {
+        vscode.window.showInformationMessage('No comment found for this preview item.');
+        return;
+      }
       if ((!editor || editor.document.languageId !== 'markdown') && rawComment) {
         editor = await getMarkdownEditorContaining(rawComment);
       }
@@ -580,113 +461,58 @@ export function activate(context: vscode.ExtensionContext) {
         return;
       }
 
-      // Parse comment details
-      const highlightMatch = targetComment.match(/^\{==([\s\S]+?)==\}\{>>([\s\S]+?)<<\}/);
-      if (!highlightMatch) {
-        return;
-      }
+      // Scroll and select in editor
+      editor.selection = new vscode.Selection(targetRange.start, targetRange.end);
+      editor.revealRange(targetRange, vscode.TextEditorRevealType.InCenterIfOutsideViewport);
 
-      const rawMeta = highlightMatch[2];
-      const parsedMeta = parseMeta(rawMeta);
+      // Focus sidebar
+      await vscode.commands.executeCommand('review-comments-sidebar.focus');
 
-      if (activeTempThread) {
-        activeTempThread.dispose();
-      }
-
-      activeTempThread = commentController.createCommentThread(editor.document.uri, targetRange, []);
-      activeTempThread.collapsibleState = vscode.CommentThreadCollapsibleState.Expanded;
-      activeTempThread.canReply = false;
-      activeTempThread.label = '';  // empty label to remove header text
-
-      const comment = new ReviewComment(
-        parsedMeta.body,
-        vscode.CommentMode.Editing,
-        { name: '' },  // empty author removes the "Reviewer" line
-        activeTempThread,
-        'editableComment'
-      );
-      activeTempThread.comments = [comment];
+      // Trigger editing in sidebar
+      await sidebarProvider.activateEditInSidebar(targetComment, editor.document.uri, 'source');
     } catch (err: any) {
       vscode.window.showErrorMessage(`Error in Edit Comment: ${err.message || err}`);
     }
   });
 
-  // Command: Submit Edit Comment
-  const submitEditCommand = vscode.commands.registerCommand('review-comments.submitEdit', async (comment: any) => {
-    try {
-      const text = (typeof comment.body === 'string' ? comment.body : comment.body.value).trim();
-      const thread = comment.parent;
-      if (!thread) {
-        return;
-      }
-      const uri = thread.uri;
-      const range = thread.range;
-      const editor = vscode.window.visibleTextEditors.find(e => e.document.uri.toString() === uri.toString());
-      if (!editor) {
-        thread.dispose();
-        return;
-      }
-
-      const currentText = editor.document.getText(range);
-      const highlightMatch = currentText.match(/^\{==([\s\S]+?)==\}\{>>([\s\S]+?)<<\}/);
-      if (!highlightMatch) {
-        thread.dispose();
-        return;
-      }
-
-      const highlightedText = highlightMatch[1];
-      const rawMeta = highlightMatch[2];
-      const parsedMeta = parseMeta(rawMeta);
-
-      const escapedBody = text.replace(/<<}/g, "<< }");
-      const newComment = `{==${highlightedText}==}{>>${parsedMeta.author}|${parsedMeta.date}: ${escapedBody}<<}`;
-
-      await editor.edit(editBuilder => {
-        editBuilder.replace(range, newComment);
-      });
-
-      thread.dispose();
-      if (activeTempThread === thread) {
-        activeTempThread = undefined;
-      }
-
-      await vscode.commands.executeCommand('workbench.action.focusActiveEditorGroup');
-      sidebarProvider.refresh();
-    } catch (err: any) {
-      vscode.window.showErrorMessage(`Error in Submit Edit Comment: ${err.message || err}`);
-    }
-  });
-
-  // Command: Cancel Edit Comment
-  const cancelEditCommand = vscode.commands.registerCommand('review-comments.cancelEdit', async (comment: any) => {
-    try {
-      const thread = comment.parent;
-      if (thread) {
-        thread.dispose();
-        if (activeTempThread === thread) {
-          activeTempThread = undefined;
-        }
-      }
-      await vscode.commands.executeCommand('workbench.action.focusActiveEditorGroup');
-    } catch (err: any) {
-      vscode.window.showErrorMessage(`Error in Cancel Edit Comment: ${err.message || err}`);
-    }
-  });
-
   context.subscriptions.push(
     addCommand,
-    openPreviewCommand,
-    revealInOwnedPreviewCommand,
     addFromPreviewCommand,
-    editFromPreviewCommand,
-    resolveFromPreviewCommand,
-    submitAddCommand,
-    cancelAddCommand,
     resolveCommand,
-    editCommand,
-    submitEditCommand,
-    cancelEditCommand
+    editCommand
   );
+
+
+  const uriHandler = vscode.window.registerUriHandler({
+    async handleUri(uri: vscode.Uri) {
+      const action = uri.path.startsWith('/') ? uri.path.slice(1) : uri.path;
+      const queryParams = new URLSearchParams(uri.query);
+      const argsStr = queryParams.get('args');
+      let args: any[] = [];
+      if (argsStr) {
+        try {
+          args = parseUriArgs(argsStr);
+        } catch (err) {
+          logChannel.appendLine(`[ReviewComments] Failed to parse URI query args: ${argsStr}`);
+        }
+      }
+
+      logChannel.appendLine(`[ReviewComments] URI Handler received action: ${action}, args: ${JSON.stringify(args)}`);
+
+      if (action === 'focus-sidebar' || action === 'sidebar.focus') {
+        await vscode.commands.executeCommand('review-comments-sidebar.focus');
+      } else if (action === 'edit') {
+        await vscode.commands.executeCommand('review-comments.edit', ...args);
+      } else if (action === 'resolve') {
+        await vscode.commands.executeCommand('review-comments.resolve', ...args);
+      } else if (action === 'addFromPreview') {
+        await vscode.commands.executeCommand('review-comments.addFromPreview', ...args);
+      } else {
+        logChannel.appendLine(`[ReviewComments] Unknown URI Handler action: ${action}`);
+      }
+    }
+  });
+  context.subscriptions.push(uriHandler);
 
 
   // Hover Provider registration
@@ -707,15 +533,15 @@ export function activate(context: vscode.ExtensionContext) {
 
       // Do not show hover if the user's cursor is on the same line as the comment (i.e. it is unfolded and they are editing it)
       const editor = vscode.window.activeTextEditor;
-      const resolveUri = vscode.Uri.parse(`command:review-comments.resolve?${encodeURIComponent(JSON.stringify(comment.full))}`);
-      const editUri = vscode.Uri.parse(`command:review-comments.edit?${encodeURIComponent(JSON.stringify(comment.full))}`);
+      const resolveUri = vscode.Uri.parse(`command:review-comments.resolve?${encodeURIComponent(JSON.stringify([comment.full]))}`);
+      const editUri = vscode.Uri.parse(`command:review-comments.edit?${encodeURIComponent(JSON.stringify([comment.full]))}`);
 
       const mdString = new vscode.MarkdownString();
       mdString.isTrusted = true;
       mdString.supportHtml = true;
 
       // Simplified hover tooltip: Author, Date, Edit, and Resolve on one line
-      mdString.appendMarkdown(`💬 **${comment.meta.author}** · *${comment.meta.date}* &emsp; [✏️ Edit](${editUri} "Edit") &nbsp; [✅ Resolve](${resolveUri} "Resolve")\n\n`);
+      mdString.appendMarkdown(`💬 **${comment.meta.author}** · *${comment.meta.date}* &emsp; [Edit](${editUri} "Edit") &nbsp; [Resolve](${resolveUri} "Resolve")\n\n`);
       mdString.appendMarkdown(`${comment.meta.body}`);
 
       // Use the actual highlight range so VS Code's hover background matches our decoration
@@ -741,6 +567,7 @@ export function activate(context: vscode.ExtensionContext) {
     logChannel.appendLine(`[ReviewComments] Initial editor found: ${initialEditor.document.fileName}`);
     triggerUpdateDecorations(initialEditor);
   }
+  syncSidebarNavigationContext();
 
   vscode.window.onDidChangeActiveTextEditor(editor => {
     if (editor) {
@@ -752,16 +579,24 @@ export function activate(context: vscode.ExtensionContext) {
     } else {
       logChannel.appendLine("[ReviewComments] Active editor changed: None");
     }
+    syncSidebarNavigationContext();
     sidebarProvider.refresh();
   }, null, context.subscriptions);
 
   vscode.window.tabGroups.onDidChangeTabs(() => {
+    syncSidebarNavigationContext();
+    sidebarProvider.refresh();
+  }, null, context.subscriptions);
+
+  vscode.window.onDidChangeVisibleTextEditors(() => {
+    syncSidebarNavigationContext();
     sidebarProvider.refresh();
   }, null, context.subscriptions);
 
   vscode.window.onDidChangeTextEditorSelection(event => {
     const editor = vscode.window.activeTextEditor;
     if (editor && event.textEditor === editor) {
+      sidebarProvider.setNavigationTarget(editor.document.uri, 'source');
 
       triggerUpdateDecorations(editor);
 
@@ -789,6 +624,13 @@ export function activate(context: vscode.ExtensionContext) {
       triggerUpdateDecorations(editor);
     }
     if (event.document.languageId === 'markdown') {
+      sidebarProvider.refresh();
+    }
+  }, null, context.subscriptions);
+
+  vscode.workspace.onDidCloseTextDocument(document => {
+    if (document.languageId === 'markdown') {
+      syncSidebarNavigationContext();
       sidebarProvider.refresh();
     }
   }, null, context.subscriptions);
@@ -887,6 +729,18 @@ function formatDate(date: Date, format: string): string {
 }
 
 export function extendMarkdownIt(md: any) {
+  // Inject document source URI so frontend scripts can resolve the path in native preview mode
+  md.core.ruler.push('review_comments_metadata', (state: any) => {
+    const docUri = state.env?.resource || lastMarkdownDocumentUri;
+    const uriScheme = vscode.env.uriScheme;
+    if (docUri) {
+      const docUriStr = docUri.toString();
+      const token = new state.Token('html_block', '', 0);
+      token.content = `<div id="vscode-markdown-preview-data" data-settings="${escapeAttribute(JSON.stringify({ source: docUriStr, uriScheme }))}" hidden></div>`;
+      state.tokens.unshift(token);
+    }
+  });
+
   md.inline.ruler.before('text', 'review_comments', (state: any, silent: boolean) => {
     const text = state.src.slice(state.pos);
     const regex = /^\{==([\s\S]+?)==\}\{>>([\s\S]+?)<<\}/;
@@ -902,11 +756,14 @@ export function extendMarkdownIt(md: any) {
       const parsedMeta = parseMeta(rawMeta);
       const commentId = `review-comment-${getCommentHash(full)}`;
       const encodedFull = encodeURIComponent(full);
-      const encodedBody = encodeURIComponent(parsedMeta.body);
 
       // 1. Highlight container open
+      const docUri = state.env?.resource || lastMarkdownDocumentUri;
+      const docUriStr = docUri ? docUri.toString() : '';
+      const uriScheme = vscode.env.uriScheme;
+      const encodedCommentPayload = encodeURIComponent(JSON.stringify([{ source: docUriStr, rawComment: full }]));
       const tHighlightOpen = state.push('html_inline', '', 0);
-      tHighlightOpen.content = `<span id="${commentId}" class="review-comment-highlight" data-review-comment-raw="${encodedFull}">`;
+      tHighlightOpen.content = `<span id="${commentId}" class="review-comment-highlight" data-review-comment-raw="${encodedFull}" data-review-comment-source="${docUriStr}">`;
 
       // 2. Highlighted text
       const tText = state.push('text', '', 0);
@@ -914,7 +771,7 @@ export function extendMarkdownIt(md: any) {
 
       // 3. Indicator badge (placed inside highlight span, styled as a link to focus the sidebar)
       const tBadge = state.push('html_inline', '', 0);
-      tBadge.content = `<a href="#" data-review-comment-action="focus-sidebar" class="review-comment-indicator-badge">💬</a>`;
+      tBadge.content = `<a href="${uriScheme}://andrew-qiqi.vscode-md-comments/sidebar.focus" class="review-comment-indicator-badge" title="Focus Sidebar">💬</a>`;
 
       // 4. Tooltip and Closing tags as a single token to prevent tag-mismatch / sanitization issues
       const tTooltipAndClose = state.push('html_inline', '', 0);
@@ -923,8 +780,8 @@ export function extendMarkdownIt(md: any) {
           `<span class="review-comment-tooltip-author">💬 <strong>${md.utils.escapeHtml(parsedMeta.author)}</strong></span>` +
           `<span class="review-comment-tooltip-date"> · <em>${md.utils.escapeHtml(parsedMeta.date)}</em></span>` +
           `<span class="review-comment-tooltip-actions">` +
-            `<a href="#" data-review-comment-action="edit" data-review-comment-raw="${encodedFull}" data-review-comment-body="${encodedBody}">Edit</a>` +
-            `<a href="#" data-review-comment-action="resolve" data-review-comment-raw="${encodedFull}">Resolve</a>` +
+            `<a href="${uriScheme}://andrew-qiqi.vscode-md-comments/edit?args=${encodedCommentPayload}" title="Edit Comment">Edit</a>` +
+            `<a href="${uriScheme}://andrew-qiqi.vscode-md-comments/resolve?args=${encodedCommentPayload}" title="Resolve Comment">Resolve</a>` +
           `</span>` +
         `</span>` +
         `<span class="review-comment-tooltip-body">${md.utils.escapeHtml(parsedMeta.body)}</span>` +
@@ -935,4 +792,16 @@ export function extendMarkdownIt(md: any) {
     return true;
   });
   return md;
+}
+
+function escapeHtml(value: string): string {
+  return value
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
+}
+
+function escapeAttribute(value: string): string {
+  return escapeHtml(value).replace(/'/g, '&#39;');
 }

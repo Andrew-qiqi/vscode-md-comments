@@ -2,7 +2,7 @@
   "name": "vscode-md-comments",
   "displayName": "VSCode MD Comments",
   "description": "Notion-style review comments stored as CriticMarkup. AI-friendly format for LLM-assisted editing.",
-  "version": "1.0.2",
+  "version": "1.0.3",
   "publisher": "andrew-qiqi",
   "repository": {
     "type": "git",
@@ -19,8 +19,7 @@
   "main": "./dist/extension.js",
   "activationEvents": [
     "onLanguage:markdown",
-    "onCommand:review-comments.openPreview",
-    "onCustomEditor:review-comments.preview"
+    "onUri"
   ],
   "contributes": {
     "commands": [
@@ -30,37 +29,12 @@
         "icon": "$(comment-discussion)"
       },
       {
-        "command": "review-comments.openPreview",
-        "title": "Open MD Comments Preview",
-        "icon": "$(open-preview)"
-      },
-      {
-        "command": "review-comments.submitAdd",
-        "title": "Save",
-        "icon": "$(check)"
-      },
-      {
-        "command": "review-comments.cancelAdd",
-        "title": "Cancel",
-        "icon": "$(close)"
-      },
-      {
         "command": "review-comments.resolve",
         "title": "Resolve Comment"
       },
       {
         "command": "review-comments.edit",
         "title": "Edit Comment"
-      },
-      {
-        "command": "review-comments.submitEdit",
-        "title": "Save",
-        "icon": "$(check)"
-      },
-      {
-        "command": "review-comments.cancelEdit",
-        "title": "Cancel",
-        "icon": "$(close)"
       }
     ],
     "keybindings": [
@@ -72,58 +46,11 @@
       }
     ],
     "menus": {
-      "commandPalette": [
-        {
-          "command": "review-comments.submitAdd",
-          "when": "false"
-        },
-        {
-          "command": "review-comments.cancelAdd",
-          "when": "false"
-        },
-        {
-          "command": "review-comments.submitEdit",
-          "when": "false"
-        },
-        {
-          "command": "review-comments.cancelEdit",
-          "when": "false"
-        }
-      ],
       "editor/context": [
         {
           "command": "review-comments.add",
           "when": "editorHasSelection && editorLangId == markdown",
           "group": "1_modification"
-        }
-      ],
-      "editor/title": [
-        {
-          "command": "review-comments.openPreview",
-          "when": "resourceLangId == markdown",
-          "group": "navigation@1"
-        }
-      ],
-      "comments/comment/context": [
-        {
-          "command": "review-comments.submitAdd",
-          "group": "inline@1",
-          "when": "comment == draftComment"
-        },
-        {
-          "command": "review-comments.cancelAdd",
-          "group": "inline@2",
-          "when": "comment == draftComment"
-        },
-        {
-          "command": "review-comments.submitEdit",
-          "group": "inline@1",
-          "when": "comment == editableComment"
-        },
-        {
-          "command": "review-comments.cancelEdit",
-          "group": "inline@2",
-          "when": "comment == editableComment"
         }
       ]
     },
@@ -169,17 +96,8 @@
     "markdown.previewStyles": [
       "./media/preview.css"
     ],
-    "customEditors": [
-      {
-        "viewType": "review-comments.preview",
-        "displayName": "MD Comments Preview",
-        "priority": "option",
-        "selector": [
-          {
-            "filenamePattern": "*.md"
-          }
-        ]
-      }
+    "markdown.previewScripts": [
+      "./media/preview.js"
     ]
   },
   "scripts": {

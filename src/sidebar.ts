@@ -1,9 +1,20 @@
 import * as vscode from 'vscode';
-import { parseAllComments, CommentMatch } from './commentParser';
+import { parseAllComments, getCommentHash } from './commentParser';
 
 export class ReviewCommentsSidebarProvider implements vscode.WebviewViewProvider {
   public static readonly viewType = 'review-comments-sidebar';
   private _view?: vscode.WebviewView;
+  private _activeDocumentUri?: vscode.Uri;
+  private _navigationTarget?: {
+    mode: 'preview' | 'source';
+    uri: vscode.Uri;
+    viewColumn?: vscode.ViewColumn;
+  };
+  private _pendingAction?: {
+    type: 'activateEdit' | 'showNewForm';
+    payload: any;
+  };
+
   constructor(private readonly _extensionContext: vscode.ExtensionContext) {}
 
   public resolveWebviewView(
@@ -21,11 +32,12 @@ export class ReviewCommentsSidebarProvider implements vscode.WebviewViewProvider
     webviewView.webview.html = this._getHtmlForWebview(webviewView.webview);
 
     webviewView.webview.onDidReceiveMessage(async (data) => {
-      const document = await this._getCurrentMarkdownDocument();
+      const document = await this._getCurrentMarkdownDocument(data.source);
 
       switch (data.type) {
         case 'ready': {
-          this.refresh();
+          await this.refresh(this._pendingAction?.payload?.source);
+          this._flushPendingAction();
           break;
         }
         case 'jump': {
@@ -33,12 +45,11 @@ export class ReviewCommentsSidebarProvider implements vscode.WebviewViewProvider
             const text = document.getText();
             const index = text.indexOf(data.full);
             if (index !== -1) {
-              const activeInput = vscode.window.tabGroups.activeTabGroup.activeTab?.input;
-              if (activeInput instanceof vscode.TabInputCustom && activeInput.viewType === 'review-comments.preview') {
-                await vscode.commands.executeCommand('review-comments.revealInOwnedPreview', document.uri.toString(), data.full);
+              if (await this._jumpInOpenPreview(document.uri, data.full)) {
                 break;
               }
 
+              this._navigationTarget = { uri: document.uri, mode: 'source' };
               const visibleEditor = vscode.window.visibleTextEditors.find(editor =>
                 editor.document.uri.toString() === document.uri.toString()
               );
@@ -66,7 +77,7 @@ export class ReviewCommentsSidebarProvider implements vscode.WebviewViewProvider
               const edit = new vscode.WorkspaceEdit();
               edit.replace(document.uri, new vscode.Range(startPos, endPos), data.highlighted);
               await vscode.workspace.applyEdit(edit);
-              this.refresh();
+              this.refresh(document.uri.toString());
             }
           }
           break;
@@ -87,8 +98,33 @@ export class ReviewCommentsSidebarProvider implements vscode.WebviewViewProvider
               const edit = new vscode.WorkspaceEdit();
               edit.replace(document.uri, new vscode.Range(startPos, endPos), newRaw);
               await vscode.workspace.applyEdit(edit);
-              this.refresh();
+              this.refresh(document.uri.toString());
             }
+          }
+          break;
+        }
+        case 'create': {
+          if (document) {
+            const rangeJson = data.range;
+            const range = new vscode.Range(
+              rangeJson.startLine,
+              rangeJson.startCharacter,
+              rangeJson.endLine,
+              rangeJson.endCharacter
+            );
+
+            const config = vscode.workspace.getConfiguration('review-comments');
+            const author = (config.get<string>('authorName') || 'you').replace(/\|/g, '').trim();
+            const dateFormat = config.get<string>('dateFormat') || 'iso';
+            const dateStr = formatDate(new Date(), dateFormat);
+
+            const escapedText = data.body.replace(/<<}/g, "<< }");
+            const commentString = `{==${data.selectedText}==}{>>${author}|${dateStr}: ${escapedText}<<}`;
+
+            const edit = new vscode.WorkspaceEdit();
+            edit.replace(document.uri, range, commentString);
+            await vscode.workspace.applyEdit(edit);
+            this.refresh(document.uri.toString());
           }
           break;
         }
@@ -112,13 +148,68 @@ export class ReviewCommentsSidebarProvider implements vscode.WebviewViewProvider
     }
   }
 
-  public async refresh() {
+  public setNavigationTarget(uri: vscode.Uri, mode: 'preview' | 'source', viewColumn?: vscode.ViewColumn) {
+    this._navigationTarget = { uri, mode, viewColumn };
+    this._activeDocumentUri = uri;
+  }
+
+  public async activateEditInSidebar(commentFullText: string, sourceUri?: vscode.Uri, mode: 'preview' | 'source' = 'source') {
+    if (sourceUri) {
+      this._activeDocumentUri = sourceUri;
+      this._navigationTarget = { uri: sourceUri, mode };
+    }
+    this._pendingAction = {
+      type: 'activateEdit',
+      payload: { full: commentFullText, source: sourceUri?.toString() }
+    };
+    if (this._view && this._view.visible) {
+      await this.refresh(sourceUri?.toString());
+      this._flushPendingAction();
+    }
+  }
+
+  public async showNewCommentForm(selectedText: string, range: vscode.Range, sourceUri: vscode.Uri, mode: 'preview' | 'source' = 'source') {
+    this._activeDocumentUri = sourceUri;
+    this._navigationTarget = { uri: sourceUri, mode };
+    const rangeJson = {
+      startLine: range.start.line,
+      startCharacter: range.start.character,
+      endLine: range.end.line,
+      endCharacter: range.end.character
+    };
+    const payload = {
+      selectedText,
+      range: rangeJson,
+      source: sourceUri.toString()
+    };
+    this._pendingAction = {
+      type: 'showNewForm',
+      payload
+    };
+    if (this._view && this._view.visible) {
+      await this.refresh(sourceUri.toString());
+      this._flushPendingAction();
+    }
+  }
+
+  public async refresh(source?: string) {
     if (!this._view) {
       return;
     }
 
-    const document = await this._getCurrentMarkdownDocument();
+    if (!source && !this._hasOpenMarkdownSurface()) {
+      this._activeDocumentUri = undefined;
+      this._navigationTarget = undefined;
+      this._view.webview.postMessage({ type: 'update', state: 'no_editor' });
+      return;
+    }
+
+    const document = await this._getCurrentMarkdownDocument(source, Boolean(source));
     if (!document) {
+      if (!source) {
+        this._activeDocumentUri = undefined;
+        this._navigationTarget = undefined;
+      }
       this._view.webview.postMessage({ type: 'update', state: 'no_editor' });
       return;
     }
@@ -129,13 +220,46 @@ export class ReviewCommentsSidebarProvider implements vscode.WebviewViewProvider
     this._view.webview.postMessage({
       type: 'update',
       state: 'loaded',
+      source: document.uri.toString(),
       comments
     });
   }
 
-  private async _getCurrentMarkdownDocument(): Promise<vscode.TextDocument | undefined> {
+  private _flushPendingAction() {
+    if (!this._pendingAction) {
+      return;
+    }
+
+    if (this._pendingAction.type === 'activateEdit') {
+      this._view?.webview.postMessage({
+        type: 'activateEdit',
+        ...this._pendingAction.payload
+      });
+    } else if (this._pendingAction.type === 'showNewForm') {
+      this._view?.webview.postMessage({
+        type: 'showNewForm',
+        ...this._pendingAction.payload
+      });
+    }
+    this._pendingAction = undefined;
+  }
+
+  private async _getCurrentMarkdownDocument(source?: string, allowStoredContext: boolean = false): Promise<vscode.TextDocument | undefined> {
+    if (source) {
+      try {
+        const document = await vscode.workspace.openTextDocument(vscode.Uri.parse(source));
+        if (document.languageId === 'markdown') {
+          this._activeDocumentUri = document.uri;
+          return document;
+        }
+      } catch {
+        // Fall back to active editor/tab below.
+      }
+    }
+
     const activeEditor = vscode.window.activeTextEditor;
     if (activeEditor?.document.languageId === 'markdown') {
+      this._activeDocumentUri = activeEditor.document.uri;
       return activeEditor.document;
     }
 
@@ -144,7 +268,11 @@ export class ReviewCommentsSidebarProvider implements vscode.WebviewViewProvider
 
     if (input instanceof vscode.TabInputText) {
       const document = await vscode.workspace.openTextDocument(input.uri);
-      return document.languageId === 'markdown' ? document : undefined;
+      if (document.languageId === 'markdown') {
+        this._activeDocumentUri = document.uri;
+        return document;
+      }
+      return undefined;
     }
 
     if (
@@ -152,7 +280,81 @@ export class ReviewCommentsSidebarProvider implements vscode.WebviewViewProvider
       (input.viewType === 'vscode.markdown.preview.editor' || input.viewType === 'review-comments.preview')
     ) {
       const document = await vscode.workspace.openTextDocument(input.uri);
+      if (document.languageId === 'markdown') {
+        this._activeDocumentUri = document.uri;
+        return document;
+      }
+      return undefined;
+    }
+
+    if (allowStoredContext && this._activeDocumentUri) {
+      const document = await vscode.workspace.openTextDocument(this._activeDocumentUri);
       return document.languageId === 'markdown' ? document : undefined;
+    }
+
+    return undefined;
+  }
+
+  private _hasOpenMarkdownSurface(): boolean {
+    if (vscode.window.visibleTextEditors.some(editor => editor.document.languageId === 'markdown')) {
+      return true;
+    }
+
+    for (const group of vscode.window.tabGroups.all) {
+      for (const tab of group.tabs) {
+        const input = tab.input;
+        if (input instanceof vscode.TabInputText) {
+          // Do not open the document here; only check already known text documents.
+          const document = vscode.workspace.textDocuments.find(doc => doc.uri.toString() === input.uri.toString());
+          if (document?.languageId === 'markdown') {
+            return true;
+          }
+        }
+        if (
+          input instanceof vscode.TabInputCustom &&
+          (input.viewType === 'vscode.markdown.preview.editor' || input.viewType === 'review-comments.preview')
+        ) {
+          return true;
+        }
+      }
+    }
+
+    return false;
+  }
+
+  private async _jumpInOpenPreview(uri: vscode.Uri, rawComment: string): Promise<boolean> {
+    const target = this._navigationTarget;
+    if (!target || target.mode !== 'preview' || target.uri.toString() !== uri.toString()) {
+      return false;
+    }
+
+    const previewColumn = target.viewColumn ?? this._findOpenPreviewColumn(uri);
+    if (!previewColumn) {
+      return false;
+    }
+
+    const hash = getCommentHash(rawComment);
+    const uriWithHash = uri.with({ fragment: `review-comment-${hash}` });
+    await vscode.commands.executeCommand('vscode.openWith', uriWithHash, 'vscode.markdown.preview.editor', {
+      viewColumn: previewColumn,
+      preserveFocus: false,
+      preview: false
+    });
+    return true;
+  }
+
+  private _findOpenPreviewColumn(uri: vscode.Uri): vscode.ViewColumn | undefined {
+    for (const group of vscode.window.tabGroups.all) {
+      for (const tab of group.tabs) {
+        const input = tab.input;
+        if (
+          input instanceof vscode.TabInputCustom &&
+          input.viewType === 'vscode.markdown.preview.editor' &&
+          input.uri.toString() === uri.toString()
+        ) {
+          return group.viewColumn;
+        }
+      }
     }
 
     return undefined;
@@ -194,6 +396,17 @@ export class ReviewCommentsSidebarProvider implements vscode.WebviewViewProvider
     .review-comment-card:hover {
       border-color: var(--vscode-button-background);
       box-shadow: 0 4px 8px rgba(0, 0, 0, 0.15);
+    }
+
+    .review-comment-card.editing {
+      border-color: var(--vscode-focusBorder, #007acc) !important;
+      box-shadow: 0 0 6px var(--vscode-focusBorder, #007acc);
+      background-color: var(--vscode-editor-inactiveSelectionBackground, rgba(0, 122, 204, 0.08));
+    }
+
+    .review-comment-card.new-comment-card {
+      border-left-color: var(--vscode-charts-green, #388a34);
+      margin-bottom: 12px;
     }
 
     .review-comment-card-header {
@@ -341,11 +554,13 @@ export class ReviewCommentsSidebarProvider implements vscode.WebviewViewProvider
   </style>
 </head>
 <body>
+  <div id="new-comment-container" style="display: none; margin-bottom: 15px;"></div>
   <div id="content"></div>
 
   <script>
     const vscode = acquireVsCodeApi();
     const contentEl = document.getElementById('content');
+    const newCommentContainerEl = document.getElementById('new-comment-container');
 
     // Signal ready to get initial data
     vscode.postMessage({ type: 'ready' });
@@ -353,7 +568,10 @@ export class ReviewCommentsSidebarProvider implements vscode.WebviewViewProvider
     window.addEventListener('message', event => {
       const message = event.data;
       if (message.type === 'update') {
-        render(message.state, message.comments || []);
+        if (newCommentContainerEl.style.display !== 'block') {
+          newCommentContainerEl.innerHTML = '';
+        }
+        render(message.state, message.comments || [], message.source);
       } else if (message.type === 'highlight') {
         const cards = document.querySelectorAll('.review-comment-card');
         cards.forEach(card => {
@@ -367,10 +585,115 @@ export class ReviewCommentsSidebarProvider implements vscode.WebviewViewProvider
             }, 1500);
           }
         });
+      } else if (message.type === 'activateEdit') {
+        const cards = document.querySelectorAll('.review-comment-card');
+        cards.forEach(card => {
+          if (card.getAttribute('data-full') === message.full) {
+            card.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+            const editContainer = card.querySelector('.review-comment-card-edit-container');
+            if (editContainer && editContainer.style.display !== 'block') {
+              const editBtn = card.querySelector('.review-comment-card-action-icon-btn[title="Edit"]');
+              if (editBtn) {
+                editBtn.click();
+              }
+            }
+          }
+        });
+      } else if (message.type === 'showNewForm') {
+        showNewCommentForm(message);
       }
     });
 
-    function render(state, comments) {
+    function showNewCommentForm(data) {
+      newCommentContainerEl.innerHTML = '';
+      newCommentContainerEl.style.display = 'block';
+      newCommentContainerEl.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+
+      // Dismiss any existing card edits
+      const activeTextareas = document.querySelectorAll('.review-comment-card-edit-container');
+      activeTextareas.forEach(el => {
+        if (el.style.display === 'block') {
+          const cancelBtn = el.querySelector('.review-comment-card-btn.cancel');
+          if (cancelBtn) cancelBtn.click();
+        }
+      });
+
+      const card = document.createElement('div');
+      card.className = 'review-comment-card new-comment-card';
+
+      const header = document.createElement('div');
+      header.className = 'review-comment-card-header';
+
+      const icon = document.createElement('span');
+      icon.className = 'review-comment-card-icon';
+      icon.textContent = '➕';
+
+      const meta = document.createElement('span');
+      meta.className = 'review-comment-card-meta';
+      meta.textContent = 'New Comment';
+
+      header.appendChild(icon);
+      header.appendChild(meta);
+
+      const original = document.createElement('div');
+      original.className = 'review-comment-card-original';
+      original.textContent = '"' + data.selectedText + '"';
+
+      const editContainer = document.createElement('div');
+      editContainer.className = 'review-comment-card-edit-container';
+      editContainer.style.display = 'block';
+
+      const textarea = document.createElement('textarea');
+      textarea.className = 'review-comment-card-textarea';
+      textarea.placeholder = 'Type your comment...';
+
+      const editActions = document.createElement('div');
+      editActions.className = 'review-comment-card-edit-actions';
+
+      const cancelBtn = document.createElement('button');
+      cancelBtn.className = 'review-comment-card-btn cancel';
+      cancelBtn.textContent = 'Cancel';
+      cancelBtn.addEventListener('click', (e) => {
+        e.stopPropagation();
+        newCommentContainerEl.style.display = 'none';
+        newCommentContainerEl.innerHTML = '';
+      });
+
+      const saveBtn = document.createElement('button');
+      saveBtn.className = 'review-comment-card-btn save';
+      saveBtn.textContent = 'Save';
+      saveBtn.addEventListener('click', (e) => {
+        e.stopPropagation();
+        const val = textarea.value.trim();
+        if (val) {
+          vscode.postMessage({
+            type: 'create',
+            selectedText: data.selectedText,
+            range: data.range,
+            source: data.source,
+            body: val
+          });
+        }
+        newCommentContainerEl.style.display = 'none';
+        newCommentContainerEl.innerHTML = '';
+      });
+
+      editActions.appendChild(cancelBtn);
+      editActions.appendChild(saveBtn);
+      editContainer.appendChild(textarea);
+      editContainer.appendChild(editActions);
+
+      card.appendChild(header);
+      card.appendChild(original);
+      card.appendChild(editContainer);
+      newCommentContainerEl.appendChild(card);
+
+      setTimeout(() => {
+        textarea.focus();
+      }, 50);
+    }
+
+    function render(state, comments, source) {
       contentEl.innerHTML = '';
 
       if (state === 'no_editor') {
@@ -393,13 +716,13 @@ export class ReviewCommentsSidebarProvider implements vscode.WebviewViewProvider
 
         // Card click handler to jump to editor range
         card.addEventListener('click', (e) => {
-          // Prevent jump if clicking inside input/buttons or during edit
           if (e.target.closest('.review-comment-card-header-actions') || 
               e.target.closest('.review-comment-card-edit-container')) {
             return;
           }
           vscode.postMessage({
             type: 'jump',
+            source,
             full: comment.full
           });
         });
@@ -473,14 +796,20 @@ export class ReviewCommentsSidebarProvider implements vscode.WebviewViewProvider
         let isEditing = false;
         const startEdit = () => {
           isEditing = true;
+          card.classList.add('editing');
           body.style.display = 'none';
           original.style.display = 'none';
           editContainer.style.display = 'block';
           textarea.focus();
+
+          // Dismiss new comment form if editing an existing card
+          newCommentContainerEl.style.display = 'none';
+          newCommentContainerEl.innerHTML = '';
         };
 
         const stopEdit = () => {
           isEditing = false;
+          card.classList.remove('editing');
           body.style.display = 'block';
           original.style.display = 'block';
           editContainer.style.display = 'none';
@@ -503,6 +832,7 @@ export class ReviewCommentsSidebarProvider implements vscode.WebviewViewProvider
           if (val) {
             vscode.postMessage({
               type: 'save',
+              source,
               full: comment.full,
               highlighted: comment.highlighted,
               author: comment.meta.author,
@@ -517,6 +847,7 @@ export class ReviewCommentsSidebarProvider implements vscode.WebviewViewProvider
           e.stopPropagation();
           vscode.postMessage({
             type: 'resolve',
+            source,
             full: comment.full,
             highlighted: comment.highlighted
           });
@@ -536,4 +867,14 @@ export class ReviewCommentsSidebarProvider implements vscode.WebviewViewProvider
 </body>
 </html>`;
   }
+}
+
+function formatDate(date: Date, format: string): string {
+  const yyyy = date.getFullYear();
+  const MM = String(date.getMonth() + 1).padStart(2, '0');
+  const dd = String(date.getDate()).padStart(2, '0');
+  if (format === 'japanese') {
+    return `${yyyy}年${MM}月${dd}日`;
+  }
+  return `${yyyy}-${MM}-${dd}`;
 }

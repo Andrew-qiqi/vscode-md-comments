@@ -174,14 +174,17 @@ export class ReviewCommentsPreviewProvider implements vscode.CustomTextEditorPro
     const nonce = getNonce();
     const styleUri = webview.asWebviewUri(vscode.Uri.joinPath(this.context.extensionUri, 'media', 'preview.css'));
     const scriptUri = webview.asWebviewUri(vscode.Uri.joinPath(this.context.extensionUri, 'media', 'preview.js'));
-    const settings = escapeAttribute(JSON.stringify({ source: document.uri.toString() }));
+    const settings = escapeAttribute(JSON.stringify({
+      source: document.uri.toString(),
+      uriScheme: vscode.env.uriScheme
+    }));
 
     return `<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src ${webview.cspSource} https: data:; style-src ${webview.cspSource} 'unsafe-inline'; script-src ${webview.cspSource};">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src ${webview.cspSource} https: data:; style-src ${webview.cspSource} 'unsafe-inline'; script-src ${webview.cspSource} 'nonce-${nonce}';">
   <link rel="stylesheet" href="${styleUri}">
   <title>${escapeHtml(document.fileName)}</title>
   <style>
