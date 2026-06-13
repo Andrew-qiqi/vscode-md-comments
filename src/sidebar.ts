@@ -1,5 +1,5 @@
 import * as vscode from 'vscode';
-import { parseAllComments, getCommentHash } from './commentParser';
+import { parseAllComments } from './commentParser';
 
 export class ReviewCommentsSidebarProvider implements vscode.WebviewViewProvider {
   public static readonly viewType = 'review-comments-sidebar';
@@ -45,7 +45,11 @@ export class ReviewCommentsSidebarProvider implements vscode.WebviewViewProvider
             const text = document.getText();
             const index = text.indexOf(data.full);
             if (index !== -1) {
-              if (await this._jumpInOpenPreview(document.uri, data.full)) {
+              const startPos = document.positionAt(index);
+              const endPos = document.positionAt(index + data.full.length);
+              const range = new vscode.Range(startPos, endPos);
+
+              if (await this._jumpInOpenPreview(document.uri, range)) {
                 break;
               }
 
@@ -58,9 +62,6 @@ export class ReviewCommentsSidebarProvider implements vscode.WebviewViewProvider
                 preserveFocus: false
               });
 
-              const startPos = document.positionAt(index);
-              const endPos = document.positionAt(index + data.full.length);
-              const range = new vscode.Range(startPos, endPos);
               editor.selection = new vscode.Selection(startPos, endPos);
               editor.revealRange(range, vscode.TextEditorRevealType.InCenter);
             }
@@ -149,12 +150,20 @@ export class ReviewCommentsSidebarProvider implements vscode.WebviewViewProvider
   }
 
   public setNavigationTarget(uri: vscode.Uri, mode: 'preview' | 'source', viewColumn?: vscode.ViewColumn) {
-    this._navigationTarget = { uri, mode, viewColumn };
-    this._activeDocumentUri = uri;
+    const sourceUri = this._sourceUri(uri);
+    this._navigationTarget = { uri: sourceUri, mode, viewColumn };
+    this._activeDocumentUri = sourceUri;
+  }
+
+  public async setNavigationTargetAndRefresh(uri: vscode.Uri, mode: 'preview' | 'source', viewColumn?: vscode.ViewColumn) {
+    const sourceUri = this._sourceUri(uri);
+    this.setNavigationTarget(sourceUri, mode, viewColumn);
+    await this.refresh(sourceUri.toString());
   }
 
   public async activateEditInSidebar(commentFullText: string, sourceUri?: vscode.Uri, mode: 'preview' | 'source' = 'source') {
     if (sourceUri) {
+      sourceUri = this._sourceUri(sourceUri);
       this._activeDocumentUri = sourceUri;
       this._navigationTarget = { uri: sourceUri, mode };
     }
@@ -169,6 +178,7 @@ export class ReviewCommentsSidebarProvider implements vscode.WebviewViewProvider
   }
 
   public async showNewCommentForm(selectedText: string, range: vscode.Range, sourceUri: vscode.Uri, mode: 'preview' | 'source' = 'source') {
+    sourceUri = this._sourceUri(sourceUri);
     this._activeDocumentUri = sourceUri;
     this._navigationTarget = { uri: sourceUri, mode };
     const rangeJson = {
@@ -220,7 +230,7 @@ export class ReviewCommentsSidebarProvider implements vscode.WebviewViewProvider
     this._view.webview.postMessage({
       type: 'update',
       state: 'loaded',
-      source: document.uri.toString(),
+      source: this._sourceUri(document.uri).toString(),
       comments
     });
   }
@@ -247,9 +257,10 @@ export class ReviewCommentsSidebarProvider implements vscode.WebviewViewProvider
   private async _getCurrentMarkdownDocument(source?: string, allowStoredContext: boolean = false): Promise<vscode.TextDocument | undefined> {
     if (source) {
       try {
-        const document = await vscode.workspace.openTextDocument(vscode.Uri.parse(source));
+        const sourceUri = this._sourceUri(vscode.Uri.parse(source));
+        const document = await vscode.workspace.openTextDocument(sourceUri);
         if (document.languageId === 'markdown') {
-          this._activeDocumentUri = document.uri;
+          this._activeDocumentUri = this._sourceUri(document.uri);
           return document;
         }
       } catch {
@@ -259,7 +270,7 @@ export class ReviewCommentsSidebarProvider implements vscode.WebviewViewProvider
 
     const activeEditor = vscode.window.activeTextEditor;
     if (activeEditor?.document.languageId === 'markdown') {
-      this._activeDocumentUri = activeEditor.document.uri;
+      this._activeDocumentUri = this._sourceUri(activeEditor.document.uri);
       return activeEditor.document;
     }
 
@@ -267,9 +278,9 @@ export class ReviewCommentsSidebarProvider implements vscode.WebviewViewProvider
     const input = activeTab?.input;
 
     if (input instanceof vscode.TabInputText) {
-      const document = await vscode.workspace.openTextDocument(input.uri);
+      const document = await vscode.workspace.openTextDocument(this._sourceUri(input.uri));
       if (document.languageId === 'markdown') {
-        this._activeDocumentUri = document.uri;
+        this._activeDocumentUri = this._sourceUri(document.uri);
         return document;
       }
       return undefined;
@@ -277,17 +288,38 @@ export class ReviewCommentsSidebarProvider implements vscode.WebviewViewProvider
 
     if (
       input instanceof vscode.TabInputCustom &&
-      (input.viewType === 'vscode.markdown.preview.editor' || input.viewType === 'review-comments.preview')
+      this._isMarkdownPreviewViewType(input.viewType)
     ) {
-      const document = await vscode.workspace.openTextDocument(input.uri);
+      const document = await vscode.workspace.openTextDocument(this._sourceUri(input.uri));
       if (document.languageId === 'markdown') {
-        this._activeDocumentUri = document.uri;
+        this._activeDocumentUri = this._sourceUri(document.uri);
         return document;
       }
       return undefined;
     }
 
-    if (allowStoredContext && this._activeDocumentUri) {
+    if (input instanceof vscode.TabInputWebview && this._isMarkdownPreviewViewType(input.viewType)) {
+      const document = await this._getStoredMarkdownDocument();
+      if (document) {
+        return document;
+      }
+    }
+
+    const visibleEditor = this._getBestVisibleMarkdownEditor();
+    if (visibleEditor) {
+      this._activeDocumentUri = this._sourceUri(visibleEditor.document.uri);
+      return visibleEditor.document;
+    }
+
+    if (allowStoredContext) {
+      return this._getStoredMarkdownDocument();
+    }
+
+    return undefined;
+  }
+
+  private async _getStoredMarkdownDocument(): Promise<vscode.TextDocument | undefined> {
+    if (this._activeDocumentUri) {
       const document = await vscode.workspace.openTextDocument(this._activeDocumentUri);
       return document.languageId === 'markdown' ? document : undefined;
     }
@@ -305,14 +337,20 @@ export class ReviewCommentsSidebarProvider implements vscode.WebviewViewProvider
         const input = tab.input;
         if (input instanceof vscode.TabInputText) {
           // Do not open the document here; only check already known text documents.
-          const document = vscode.workspace.textDocuments.find(doc => doc.uri.toString() === input.uri.toString());
+          const document = vscode.workspace.textDocuments.find(doc => this._sameSourceUri(doc.uri, input.uri));
           if (document?.languageId === 'markdown') {
             return true;
           }
         }
         if (
           input instanceof vscode.TabInputCustom &&
-          (input.viewType === 'vscode.markdown.preview.editor' || input.viewType === 'review-comments.preview')
+          this._isMarkdownPreviewViewType(input.viewType)
+        ) {
+          return true;
+        }
+        if (
+          input instanceof vscode.TabInputWebview &&
+          this._isMarkdownPreviewViewType(input.viewType)
         ) {
           return true;
         }
@@ -322,20 +360,31 @@ export class ReviewCommentsSidebarProvider implements vscode.WebviewViewProvider
     return false;
   }
 
-  private async _jumpInOpenPreview(uri: vscode.Uri, rawComment: string): Promise<boolean> {
+  private async _jumpInOpenPreview(uri: vscode.Uri, range: vscode.Range): Promise<boolean> {
+    const sourceUri = this._sourceUri(uri);
     const target = this._navigationTarget;
-    if (!target || target.mode !== 'preview' || target.uri.toString() !== uri.toString()) {
+    if (!target || target.mode !== 'preview' || !this._sameSourceUri(target.uri, sourceUri)) {
       return false;
     }
 
-    const previewColumn = target.viewColumn ?? this._findOpenPreviewColumn(uri);
+    const previewColumn = this._findOpenPreviewColumn(sourceUri);
     if (!previewColumn) {
       return false;
     }
 
-    const hash = getCommentHash(rawComment);
-    const uriWithHash = uri.with({ fragment: `review-comment-${hash}` });
-    await vscode.commands.executeCommand('vscode.openWith', uriWithHash, 'vscode.markdown.preview.editor', {
+    const document = await vscode.workspace.openTextDocument(sourceUri);
+    const visibleEditor = vscode.window.visibleTextEditors.find(editor =>
+      this._sameSourceUri(editor.document.uri, sourceUri)
+    );
+    const editor = visibleEditor ?? await vscode.window.showTextDocument(document, {
+      viewColumn: this._sourceColumnForPreview(previewColumn),
+      preview: false,
+      preserveFocus: true
+    });
+    editor.selection = new vscode.Selection(range.start, range.end);
+    editor.revealRange(range, vscode.TextEditorRevealType.InCenter);
+
+    await vscode.commands.executeCommand('vscode.openWith', sourceUri, 'vscode.markdown.preview.editor', {
       viewColumn: previewColumn,
       preserveFocus: false,
       preview: false
@@ -349,8 +398,16 @@ export class ReviewCommentsSidebarProvider implements vscode.WebviewViewProvider
         const input = tab.input;
         if (
           input instanceof vscode.TabInputCustom &&
-          input.viewType === 'vscode.markdown.preview.editor' &&
-          input.uri.toString() === uri.toString()
+          this._isMarkdownPreviewViewType(input.viewType) &&
+          this._sameSourceUri(input.uri, uri)
+        ) {
+          return group.viewColumn;
+        }
+        if (
+          input instanceof vscode.TabInputWebview &&
+          this._isMarkdownPreviewViewType(input.viewType) &&
+          this._activeDocumentUri &&
+          this._sameSourceUri(this._activeDocumentUri, uri)
         ) {
           return group.viewColumn;
         }
@@ -358,6 +415,38 @@ export class ReviewCommentsSidebarProvider implements vscode.WebviewViewProvider
     }
 
     return undefined;
+  }
+
+  private _sourceColumnForPreview(previewColumn: vscode.ViewColumn): vscode.ViewColumn {
+    return previewColumn === vscode.ViewColumn.One ? vscode.ViewColumn.Beside : vscode.ViewColumn.One;
+  }
+
+  private _getBestVisibleMarkdownEditor(): vscode.TextEditor | undefined {
+    if (this._activeDocumentUri) {
+      const matchingEditor = vscode.window.visibleTextEditors.find(editor =>
+        editor.document.languageId === 'markdown' &&
+        this._sameSourceUri(editor.document.uri, this._activeDocumentUri!)
+      );
+      if (matchingEditor) {
+        return matchingEditor;
+      }
+    }
+
+    return vscode.window.visibleTextEditors.find(editor => editor.document.languageId === 'markdown');
+  }
+
+  private _isMarkdownPreviewViewType(viewType: string): boolean {
+    return viewType === 'vscode.markdown.preview.editor' ||
+      viewType === 'markdown.preview' ||
+      viewType === 'review-comments.preview';
+  }
+
+  private _sourceUri(uri: vscode.Uri): vscode.Uri {
+    return uri.with({ fragment: '' });
+  }
+
+  private _sameSourceUri(left: vscode.Uri, right: vscode.Uri): boolean {
+    return this._sourceUri(left).toString() === this._sourceUri(right).toString();
   }
 
   private _getHtmlForWebview(webview: vscode.Webview): string {

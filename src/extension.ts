@@ -32,8 +32,30 @@ let commentDecorationType: vscode.TextEditorDecorationType;
 let logChannel: vscode.OutputChannel;
 let decorationTimeout: NodeJS.Timeout | undefined = undefined;
 let lastMarkdownDocumentUri: vscode.Uri | undefined = undefined;
+let resolvingDynamicPreviewSource = false;
+const dynamicPreviewSourcesByColumn = new Map<number, vscode.Uri>();
 
+function sourceUri(uri: vscode.Uri): vscode.Uri {
+  return uri.with({ fragment: '' });
+}
 
+function sourceUriString(uri: vscode.Uri | string | undefined): string {
+  if (!uri) {
+    return '';
+  }
+  if (typeof uri === 'string') {
+    try {
+      return sourceUri(vscode.Uri.parse(uri)).toString();
+    } catch {
+      return uri.split('#')[0];
+    }
+  }
+  return sourceUri(uri).toString();
+}
+
+function isMarkdownPreviewViewType(viewType: string): boolean {
+  return viewType === 'vscode.markdown.preview.editor' || viewType === 'markdown.preview';
+}
 
 export function activate(context: vscode.ExtensionContext) {
   logChannel = vscode.window.createOutputChannel("Review Comments");
@@ -79,13 +101,13 @@ export function activate(context: vscode.ExtensionContext) {
   async function getBestMarkdownEditor(): Promise<vscode.TextEditor | undefined> {
     const activeEditor = vscode.window.activeTextEditor;
     if (activeEditor?.document.languageId === 'markdown') {
-      lastMarkdownDocumentUri = activeEditor.document.uri;
+      lastMarkdownDocumentUri = sourceUri(activeEditor.document.uri);
       return activeEditor;
     }
 
     const visibleEditor = vscode.window.visibleTextEditors.find(editor => editor.document.languageId === 'markdown');
     if (visibleEditor) {
-      lastMarkdownDocumentUri = visibleEditor.document.uri;
+      lastMarkdownDocumentUri = sourceUri(visibleEditor.document.uri);
       return visibleEditor;
     }
 
@@ -99,7 +121,7 @@ export function activate(context: vscode.ExtensionContext) {
 
     const markdownDocument = vscode.workspace.textDocuments.find(document => document.languageId === 'markdown');
     if (markdownDocument) {
-      lastMarkdownDocumentUri = markdownDocument.uri;
+      lastMarkdownDocumentUri = sourceUri(markdownDocument.uri);
       return vscode.window.showTextDocument(markdownDocument, {
         preview: false,
         viewColumn: vscode.ViewColumn.Beside
@@ -112,9 +134,9 @@ export function activate(context: vscode.ExtensionContext) {
   async function getMarkdownEditorContaining(text: string, source?: string): Promise<vscode.TextEditor | undefined> {
     if (source) {
       try {
-        const document = await vscode.workspace.openTextDocument(vscode.Uri.parse(source));
+        const document = await vscode.workspace.openTextDocument(sourceUri(vscode.Uri.parse(source)));
         if (document.languageId === 'markdown' && document.getText().includes(text)) {
-          lastMarkdownDocumentUri = document.uri;
+          lastMarkdownDocumentUri = sourceUri(document.uri);
           return vscode.window.showTextDocument(document, {
             preview: false,
             viewColumn: vscode.ViewColumn.Beside
@@ -129,7 +151,7 @@ export function activate(context: vscode.ExtensionContext) {
       editor.document.languageId === 'markdown' && editor.document.getText().includes(text)
     );
     if (visibleEditor) {
-      lastMarkdownDocumentUri = visibleEditor.document.uri;
+      lastMarkdownDocumentUri = sourceUri(visibleEditor.document.uri);
       return visibleEditor;
     }
 
@@ -137,7 +159,7 @@ export function activate(context: vscode.ExtensionContext) {
       document.languageId === 'markdown' && document.getText().includes(text)
     );
     if (openDocument) {
-      lastMarkdownDocumentUri = openDocument.uri;
+      lastMarkdownDocumentUri = sourceUri(openDocument.uri);
       return vscode.window.showTextDocument(openDocument, {
         preview: false,
         viewColumn: vscode.ViewColumn.Beside
@@ -150,9 +172,9 @@ export function activate(context: vscode.ExtensionContext) {
   async function getMarkdownDocument(source?: string): Promise<vscode.TextDocument | undefined> {
     if (source) {
       try {
-        const document = await vscode.workspace.openTextDocument(vscode.Uri.parse(source));
+        const document = await vscode.workspace.openTextDocument(sourceUri(vscode.Uri.parse(source)));
         if (document.languageId === 'markdown') {
-          lastMarkdownDocumentUri = document.uri;
+          lastMarkdownDocumentUri = sourceUri(document.uri);
           return document;
         }
       } catch {
@@ -162,13 +184,13 @@ export function activate(context: vscode.ExtensionContext) {
 
     const activeEditor = vscode.window.activeTextEditor;
     if (activeEditor?.document.languageId === 'markdown') {
-      lastMarkdownDocumentUri = activeEditor.document.uri;
+      lastMarkdownDocumentUri = sourceUri(activeEditor.document.uri);
       return activeEditor.document;
     }
 
     const visibleEditor = vscode.window.visibleTextEditors.find(editor => editor.document.languageId === 'markdown');
     if (visibleEditor) {
-      lastMarkdownDocumentUri = visibleEditor.document.uri;
+      lastMarkdownDocumentUri = sourceUri(visibleEditor.document.uri);
       return visibleEditor.document;
     }
 
@@ -203,38 +225,111 @@ export function activate(context: vscode.ExtensionContext) {
 
   async function getActiveMarkdownUri(resource?: vscode.Uri): Promise<vscode.Uri | undefined> {
     if (resource instanceof vscode.Uri) {
-      return resource;
+      return sourceUri(resource);
     }
 
     const activeEditor = vscode.window.activeTextEditor;
     if (activeEditor?.document.languageId === 'markdown') {
-      return activeEditor.document.uri;
+      return sourceUri(activeEditor.document.uri);
     }
 
     const input = vscode.window.tabGroups.activeTabGroup.activeTab?.input;
     if (input instanceof vscode.TabInputText) {
-      const document = await vscode.workspace.openTextDocument(input.uri);
-      return document.languageId === 'markdown' ? document.uri : undefined;
+      const document = await vscode.workspace.openTextDocument(sourceUri(input.uri));
+      return document.languageId === 'markdown' ? sourceUri(document.uri) : undefined;
     }
 
-    if (input instanceof vscode.TabInputCustom && input.viewType === 'vscode.markdown.preview.editor') {
-      return input.uri;
+    if (input instanceof vscode.TabInputCustom && isMarkdownPreviewViewType(input.viewType)) {
+      return sourceUri(input.uri);
+    }
+
+    if (input instanceof vscode.TabInputWebview && isMarkdownPreviewViewType(input.viewType)) {
+      return dynamicPreviewSourcesByColumn.get(vscode.window.tabGroups.activeTabGroup.viewColumn) ?? lastMarkdownDocumentUri;
     }
 
     return undefined;
   }
 
-  function syncSidebarNavigationContext() {
+  function visibleMarkdownSourceForPreview(): vscode.Uri | undefined {
+    if (lastMarkdownDocumentUri && vscode.window.visibleTextEditors.some(editor =>
+      editor.document.languageId === 'markdown' &&
+      sourceUri(editor.document.uri).toString() === lastMarkdownDocumentUri?.toString()
+    )) {
+      return lastMarkdownDocumentUri;
+    }
+
+    const visibleEditor = vscode.window.visibleTextEditors.find(editor => editor.document.languageId === 'markdown');
+    return visibleEditor ? sourceUri(visibleEditor.document.uri) : undefined;
+  }
+
+  async function resolveDynamicPreviewSourceFromNative(previewColumn: vscode.ViewColumn): Promise<vscode.Uri | undefined> {
+    if (resolvingDynamicPreviewSource) {
+      return undefined;
+    }
+
+    resolvingDynamicPreviewSource = true;
+    try {
+      await vscode.commands.executeCommand('markdown.showSource');
+      const editor = vscode.window.activeTextEditor;
+      if (!editor || editor.document.languageId !== 'markdown') {
+        return undefined;
+      }
+
+      const uri = sourceUri(editor.document.uri);
+      lastMarkdownDocumentUri = uri;
+      dynamicPreviewSourcesByColumn.set(previewColumn, uri);
+      return uri;
+    } finally {
+      resolvingDynamicPreviewSource = false;
+    }
+  }
+
+  async function syncSidebarNavigationContext(): Promise<boolean> {
     const activeEditor = vscode.window.activeTextEditor;
     if (activeEditor?.document.languageId === 'markdown') {
-      sidebarProvider.setNavigationTarget(activeEditor.document.uri, 'source');
-      return;
+      const uri = sourceUri(activeEditor.document.uri);
+      lastMarkdownDocumentUri = uri;
+      sidebarProvider.setNavigationTarget(uri, 'source');
+      return false;
     }
 
     const input = vscode.window.tabGroups.activeTabGroup.activeTab?.input;
-    if (input instanceof vscode.TabInputCustom && input.viewType === 'vscode.markdown.preview.editor') {
-      sidebarProvider.setNavigationTarget(input.uri, 'preview', vscode.window.tabGroups.activeTabGroup.viewColumn);
+    if (input instanceof vscode.TabInputCustom && isMarkdownPreviewViewType(input.viewType)) {
+      const uri = sourceUri(input.uri);
+      lastMarkdownDocumentUri = uri;
+      sidebarProvider.setNavigationTarget(uri, 'preview', vscode.window.tabGroups.activeTabGroup.viewColumn);
+      return false;
     }
+
+    if (input instanceof vscode.TabInputWebview && isMarkdownPreviewViewType(input.viewType)) {
+      const previewColumn = vscode.window.tabGroups.activeTabGroup.viewColumn;
+      let resolvedFromNative = false;
+      let uri = dynamicPreviewSourcesByColumn.get(previewColumn) ?? visibleMarkdownSourceForPreview();
+      if (!uri) {
+        const resolvedUri = await resolveDynamicPreviewSourceFromNative(previewColumn);
+        if (resolvedUri) {
+          uri = resolvedUri;
+          resolvedFromNative = true;
+        }
+      }
+      uri = uri ?? lastMarkdownDocumentUri;
+      if (uri) {
+        const normalizedUri = sourceUri(uri);
+        lastMarkdownDocumentUri = normalizedUri;
+        dynamicPreviewSourcesByColumn.set(previewColumn, normalizedUri);
+        await sidebarProvider.setNavigationTargetAndRefresh(normalizedUri, 'preview', previewColumn);
+        if (resolvedFromNative) {
+          try {
+            await vscode.commands.executeCommand('workbench.action.navigateBack');
+          } catch {
+            // Navigation history may not include the preview. Keeping the real source open is better than losing context.
+          }
+        }
+        return true;
+      }
+    }
+
+    return false;
   }
 
   // Command: Add Comment to Selection
@@ -562,41 +657,47 @@ export function activate(context: vscode.ExtensionContext) {
   const initialEditor = vscode.window.activeTextEditor;
   if (initialEditor) {
     if (initialEditor.document.languageId === 'markdown') {
-      lastMarkdownDocumentUri = initialEditor.document.uri;
+      lastMarkdownDocumentUri = sourceUri(initialEditor.document.uri);
     }
     logChannel.appendLine(`[ReviewComments] Initial editor found: ${initialEditor.document.fileName}`);
     triggerUpdateDecorations(initialEditor);
   }
-  syncSidebarNavigationContext();
+  void syncSidebarNavigationContext();
 
-  vscode.window.onDidChangeActiveTextEditor(editor => {
+  vscode.window.onDidChangeActiveTextEditor(async editor => {
     if (editor) {
       if (editor.document.languageId === 'markdown') {
-        lastMarkdownDocumentUri = editor.document.uri;
+        lastMarkdownDocumentUri = sourceUri(editor.document.uri);
       }
       logChannel.appendLine(`[ReviewComments] Active editor changed: ${editor.document.fileName}`);
       triggerUpdateDecorations(editor);
     } else {
       logChannel.appendLine("[ReviewComments] Active editor changed: None");
     }
-    syncSidebarNavigationContext();
-    sidebarProvider.refresh();
+    const alreadyRefreshed = await syncSidebarNavigationContext();
+    if (!alreadyRefreshed) {
+      await sidebarProvider.refresh();
+    }
   }, null, context.subscriptions);
 
-  vscode.window.tabGroups.onDidChangeTabs(() => {
-    syncSidebarNavigationContext();
-    sidebarProvider.refresh();
+  vscode.window.tabGroups.onDidChangeTabs(async () => {
+    const alreadyRefreshed = await syncSidebarNavigationContext();
+    if (!alreadyRefreshed) {
+      await sidebarProvider.refresh();
+    }
   }, null, context.subscriptions);
 
-  vscode.window.onDidChangeVisibleTextEditors(() => {
-    syncSidebarNavigationContext();
-    sidebarProvider.refresh();
+  vscode.window.onDidChangeVisibleTextEditors(async () => {
+    const alreadyRefreshed = await syncSidebarNavigationContext();
+    if (!alreadyRefreshed) {
+      await sidebarProvider.refresh();
+    }
   }, null, context.subscriptions);
 
   vscode.window.onDidChangeTextEditorSelection(event => {
     const editor = vscode.window.activeTextEditor;
     if (editor && event.textEditor === editor) {
-      sidebarProvider.setNavigationTarget(editor.document.uri, 'source');
+      sidebarProvider.setNavigationTarget(sourceUri(editor.document.uri), 'source');
 
       triggerUpdateDecorations(editor);
 
@@ -628,10 +729,12 @@ export function activate(context: vscode.ExtensionContext) {
     }
   }, null, context.subscriptions);
 
-  vscode.workspace.onDidCloseTextDocument(document => {
+  vscode.workspace.onDidCloseTextDocument(async document => {
     if (document.languageId === 'markdown') {
-      syncSidebarNavigationContext();
-      sidebarProvider.refresh();
+      const alreadyRefreshed = await syncSidebarNavigationContext();
+      if (!alreadyRefreshed) {
+        await sidebarProvider.refresh();
+      }
     }
   }, null, context.subscriptions);
 
@@ -734,7 +837,7 @@ export function extendMarkdownIt(md: any) {
     const docUri = state.env?.resource || lastMarkdownDocumentUri;
     const uriScheme = vscode.env.uriScheme;
     if (docUri) {
-      const docUriStr = docUri.toString();
+      const docUriStr = sourceUriString(docUri);
       const token = new state.Token('html_block', '', 0);
       token.content = `<div id="vscode-markdown-preview-data" data-settings="${escapeAttribute(JSON.stringify({ source: docUriStr, uriScheme }))}" hidden></div>`;
       state.tokens.unshift(token);
@@ -759,7 +862,7 @@ export function extendMarkdownIt(md: any) {
 
       // 1. Highlight container open
       const docUri = state.env?.resource || lastMarkdownDocumentUri;
-      const docUriStr = docUri ? docUri.toString() : '';
+      const docUriStr = sourceUriString(docUri);
       const uriScheme = vscode.env.uriScheme;
       const encodedCommentPayload = encodeURIComponent(JSON.stringify([{ source: docUriStr, rawComment: full }]));
       const tHighlightOpen = state.push('html_inline', '', 0);

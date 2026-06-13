@@ -2,7 +2,7 @@
   "name": "vscode-md-comments",
   "displayName": "VSCode MD Comments",
   "description": "Notion-style review comments stored as CriticMarkup. AI-friendly format for LLM-assisted editing.",
-  "version": "1.0.3",
+  "version": "1.0.4",
   "publisher": "andrew-qiqi",
   "repository": {
     "type": "git",

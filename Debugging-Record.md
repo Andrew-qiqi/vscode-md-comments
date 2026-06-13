@@ -63,3 +63,65 @@
 - Change: Kept the source editor reveal path as a fallback when no open preview tab can be found.
 - Verification: Ran `npx tsc --noEmit` and `npm run compile`; both completed successfully.
 - Result: Sidebar card clicks now prefer the existing native preview tab before opening/revealing source.
+
+## 2026-06-13 Sidebar preview jump ignores existing preview after hash navigation
+
+- Method: Traced the sidebar `jump` message through `_jumpInOpenPreview`, preview tab matching, Markdown-it preview metadata, and `media/preview.js` hash handling.
+- Finding: After the first preview jump, the preview tab/source URI can carry a `#review-comment-*` fragment. Later comparisons treated `file.md#review-comment-*` and `file.md` as different sources, so the existing preview was not reliably reused.
+- Finding: Re-clicking the same sidebar card can keep the same hash, so the native preview page may not fire `hashchange` and the scroll highlight appears to do nothing.
+- Change: Normalized Markdown source URIs by stripping fragments before storing navigation context, opening source documents, matching preview tabs, and emitting preview/sidebar command payloads.
+- Change: Added a per-jump nonce to preview hash fragments and taught `media/preview.js` to strip that nonce before looking up the real comment element id.
+- Verification: Ran `npx tsc --noEmit` and `npm run compile`; both completed successfully.
+- Result: Sidebar card clicks should reuse the already-open native Markdown preview for the same source file and trigger scrolling even when the same comment is clicked repeatedly.
+
+## 2026-06-13 Sidebar preview jump still opens new preview with hash URI
+
+- Method: Rechecked VS Code's built-in Markdown preview implementation after user feedback. The custom editor preview identity includes the opened URI, so `vscode.openWith(file.md#hash, vscode.markdown.preview.editor)` can create a separate preview input.
+- Finding: Native Markdown preview has an internal `scrollTo(line)` path, but it is not exposed as a public command to other extensions. It is triggered by source editor visible-range/selection sync.
+- Change: Removed hash-based native preview opening from sidebar jumps. When a matching preview is open, the sidebar now reveals the source range to drive VS Code's built-in preview scroll sync, then refocuses the existing preview with the fragment-free source URI.
+- Verification: Ran `npx tsc --noEmit` and `npm run compile`; both completed successfully.
+- Result: Sidebar card clicks should stop creating hash-based duplicate previews and should scroll the existing native preview through VS Code's source-to-preview synchronization.
+
+## 2026-06-13 Dynamic Markdown preview clears sidebar context
+
+- Method: Checked VS Code tab input types and the built-in Markdown preview implementation after source-left/preview-right feedback.
+- Finding: `Open Preview` can use a dynamic webview tab with view type `markdown.preview`, not only the custom editor view type `vscode.markdown.preview.editor`. `TabInputWebview` exposes the view type but not the source URI.
+- Finding: When focus moved from the source editor to this dynamic preview, the sidebar could not resolve the active Markdown document and rendered an empty/no-editor state.
+- Change: Treat `markdown.preview` as a Markdown surface. When it is active, use the stored or visible Markdown source document as the preview's source context.
+- Change: Updated extension navigation context sync to mark dynamic Markdown preview focus as preview mode for the last/visible Markdown source.
+- Verification: Ran `npx tsc --noEmit` and `npm run compile`; both completed successfully.
+- Result: With source and preview open side by side, clicking the preview should keep the sidebar populated with the source document's comments.
+
+## 2026-06-13 Preview source context should come from injected preview metadata
+
+- Method: Revisited the dynamic preview context strategy after noting that fallback to recent/visible source is weaker than using metadata already injected into the preview.
+- Finding: The Markdown-it plugin injects `#vscode-markdown-preview-data` into every preview render with the source URI, even when the document has no comments.
+- Change: Tried a `previewActive` URI handler action so the preview script could report its injected source URI on pointer/focus/content-update events.
+- Verification: Ran `npx tsc --noEmit` and `npm run compile`; both completed successfully.
+- Result: Superseded by the next entry after user reported blank native previews.
+
+## 2026-06-13 Preview goes blank after automatic previewActive URI reporting
+
+- Method: Rechecked `media/preview.js` after user reported all Markdown preview variants rendered blank.
+- Finding: Programmatically creating and clicking a custom-scheme anchor from inside the native preview can be treated as webview navigation, replacing the preview content with a blank page.
+- Change: Removed automatic `previewActive` custom URI dispatch from preview load, pointer, focus, and content-update events, then removed the now-unused handler/provider method. Kept non-navigating dynamic preview/source fallback logic in the extension.
+- Verification: Ran `npx tsc --noEmit` and `npm run compile`; both completed successfully.
+- Result: Native Markdown preview should render again; do not use programmatic anchor clicks from preview scripts for background context reporting.
+
+## 2026-06-13 Resolve dynamic native preview source through markdown.showSource
+
+- Method: Rechecked the built-in Markdown extension command path. Dynamic `markdown.preview` keeps its source mapping internally and exposes it indirectly through `markdown.showSource`.
+- Finding: Recent/visible-source fallback is not robust when only a dynamic preview remains or when multiple Markdown documents are open.
+- Change: Added a dynamic-preview source cache keyed by preview column. If a dynamic preview has no cached/visible source, call `markdown.showSource`, read the source editor URI that VS Code opens, cache it, and try `workbench.action.navigateBack` to return focus to the preview.
+- Change: Made tab/editor visibility handlers await navigation-context sync before refreshing the sidebar to avoid transient empty states.
+- Verification: Ran `npx tsc --noEmit` and `npm run compile`; both completed successfully.
+- Result: Dynamic native preview source resolution now uses VS Code's own preview-source mapping before falling back to stored context.
+
+## 2026-06-13 Refresh sidebar from resolved dynamic preview source before returning
+
+- Method: Rechecked the dynamic-preview-only flow after user feedback: `markdown.showSource` opened the correct source, then focus returned toward preview, but the sidebar still stayed empty.
+- Finding: The source URI was resolved correctly, but the sidebar was still refreshed later through the normal active-context path. After `navigateBack`, that path can no longer see a source editor and can overwrite the resolved context with an empty state.
+- Change: Made dynamic-preview context sync refresh the sidebar directly with the resolved source URI before attempting `workbench.action.navigateBack`.
+- Change: Made context sync report when it already refreshed the sidebar, so editor/tab visibility events do not immediately run a second source-less refresh.
+- Verification: Ran `npx tsc --noEmit` and `npm run compile`; both completed successfully.
+- Result: Dynamic preview source resolution and sidebar loading now happen as one ordered operation.

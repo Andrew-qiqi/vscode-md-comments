@@ -143,6 +143,7 @@
     } catch {
       id = window.location.hash.slice(1);
     }
+    id = id.split(":")[0];
 
     const target = document.getElementById(id);
     if (!target) {
